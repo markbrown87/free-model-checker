@@ -1,0 +1,3 @@
+OpenRouter models API error: ${error_type} ${error_code}
+
+${error_message}

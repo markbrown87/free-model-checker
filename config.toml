@@ -1,0 +1,48 @@
+# free-model-checker configuration (non-secret settings).
+# Secrets live in .env — see .env.example.
+
+[api]
+# Models endpoint. Point at a local mock server to test scenarios.
+url = "https://openrouter.ai/api/v1/models"
+# Per-request HTTP timeout in seconds.
+timeout_seconds = 30
+
+[schedule]
+# Poll interval: "<n>s", "<n>m", "<n>h", "<n>d", or a bare number of seconds.
+interval = "1h"
+# Run a cycle immediately at startup instead of waiting one interval.
+run_on_start = true
+# Delay after a failed cycle (fetch/HTTP/parse/empty) before retrying.
+retry_delay = "5m"
+
+[detection]
+# zero_price | suffix | either
+mode = "zero_price"
+# Drop models whose architecture.output_modalities lacks "text".
+text_only = true
+# fnmatch globs against the model id; matches are ignored entirely.
+blacklist = ["openrouter/*"]
+# Skip a cycle when the model count drops below this fraction of the last
+# successful cycle. 0 disables the guard.
+sanity_min_fraction = 0.5
+
+[discord]
+# embed | plain
+message_format = "embed"
+# Webhook display name.
+username = "Free Model Checker"
+# once | every
+error_notify = "once"
+notify_recovery = true
+notify_on_first_run = true
+
+[icons]
+new = "🆕"
+removed = "❌"
+error = "⚠️"
+recovery = "✅"
+
+[colors]
+new = "#2ECC71"
+removed = "#E74C3C"
+error = "#F1C40F"

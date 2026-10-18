@@ -1,0 +1,4 @@
+The OpenRouter models API is responding again.
+
+Downtime: ${downtime}
+Failed cycles: ${failed_cycles}
