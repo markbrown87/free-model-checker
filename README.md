@@ -1,6 +1,6 @@
 # free-model-checker
 
-A self-running Docker Compose service that watches the [OpenRouter](https://openrouter.ai) models catalog and pings a private Discord channel whenever the set of free models changes. On a configurable interval a single dependency-free Python process fetches the models API, computes the current free set (models whose input and output price are both `$0`), and diffs it against state persisted on a bind-mounted volume. New free models get a 🆕 embed with the ID, name, context length, modalities and summary so you can evaluate them without opening the docs; models leaving the free set get a ❌ embed with the reason (`now has pricing` or `no longer listed`), rendered from the stored snapshot so the details survive even after the model disappears. API failures get a ⚠️ embed (first of a streak by default) and recovery gets a ✅ embed, so you are never surprised by a silent outage or a promo quietly turning into a paid model. Message wording lives in bind-mounted template files and all non-secret settings live in a single `config.toml`, so you can re-skin or re-tune without rebuilding the image. The service runs as a non-root user with `restart: unless-stopped` and never needs Python installed on the host.
+A self-running Docker Compose service that watches the [OpenRouter](https://openrouter.ai) models catalog and pings a private Discord channel whenever the set of free models changes. On a configurable interval a single dependency-free Python process fetches the models API, computes the current free set (models whose input and output price are both `$0`), and diffs it against state persisted on a bind-mounted volume. New free models get a 🆕 embed with the ID, name, context length, modalities and summary so you can evaluate them without opening the docs; models leaving the free set get a ❌ embed with the reason (`now has pricing`, `no longer listed`, or `no longer free`), rendered from the stored snapshot so the details survive even after the model disappears. API failures get a ⚠️ embed (first of a streak by default) and recovery gets a ✅ embed, so you are never surprised by a silent outage or a promo quietly turning into a paid model. Message wording lives in bind-mounted template files and all non-secret settings live in a single `config.toml`, so you can re-skin or re-tune without rebuilding the image. The service runs as a non-root user with `restart: unless-stopped` and never needs Python installed on the host.
 
 ## Prerequisites
 
@@ -167,7 +167,7 @@ Placeholders available to every template:
 | `${modalities}` | Formatted modality, e.g. `text + image → text`. |
 | `${summary}` | `description` truncated at ~280 characters on a word boundary + `…` (Discord-escaped). |
 | `${url}` | `https://openrouter.ai/<id>`. |
-| `${reason}` | `now has pricing` or `no longer listed` (removal only). |
+| `${reason}` | Removal reason (removal only): `now has pricing` (still listed, no longer zero-priced), `no longer listed` (absent from the API response), or `no longer free` (still zero-priced but filtered out of the free set by the blacklist or the `text_only` rule). |
 | `${error_type}` | `http`, `timeout`, `parse`, or `empty` (error only). |
 | `${error_code}` | HTTP status string, else empty (error only). |
 | `${error_message}` | Response body / exception text, truncated to ~500 characters (error only). |

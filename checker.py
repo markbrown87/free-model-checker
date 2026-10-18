@@ -447,17 +447,21 @@ def load_templates(templates_dir: str) -> dict:
 # --------------------------------------------------------------------------- #
 
 
-def is_free_model(model: dict, mode: str) -> bool:
-    pricing = model.get("pricing")
+def is_zero_priced(pricing) -> bool:
+    """True when both prompt and completion prices are exactly the string "0"."""
     if not isinstance(pricing, dict):
-        pricing = {}
-    zero_price = pricing.get("prompt") == "0" and pricing.get("completion") == "0"
+        return False
+    return pricing.get("prompt") == "0" and pricing.get("completion") == "0"
+
+
+def is_free_model(model: dict, mode: str) -> bool:
     model_id = model.get("id")
     suffix = isinstance(model_id, str) and model_id.endswith(":free")
-    if mode == "zero_price":
-        return zero_price
     if mode == "suffix":
         return suffix
+    zero_price = is_zero_priced(model.get("pricing"))
+    if mode == "zero_price":
+        return zero_price
     return zero_price or suffix
 
 
@@ -496,15 +500,19 @@ def compute_free_set(data: list, cfg: dict) -> dict:
 
 
 def removal_reason(model_id: str, all_by_id: dict) -> str:
-    """'now has pricing' when still listed with non-zero price, else 'no longer listed'."""
+    """Why an id left the free set; three-valued.
+
+    - "no longer listed" - the id is absent from the API response.
+    - "now has pricing"  - the id is still listed but is no longer zero-priced.
+    - "no longer free"   - the id is still zero-priced but filtered out of the
+      free set (blacklist glob or the text_only rule).
+    """
     model = all_by_id.get(model_id)
-    if model is not None:
-        pricing = model.get("pricing")
-        if not isinstance(pricing, dict):
-            pricing = {}
-        if not (pricing.get("prompt") == "0" and pricing.get("completion") == "0"):
-            return "now has pricing"
-    return "no longer listed"
+    if model is None:
+        return "no longer listed"
+    if not is_zero_priced(model.get("pricing")):
+        return "now has pricing"
+    return "no longer free"
 
 
 # --------------------------------------------------------------------------- #
@@ -517,7 +525,11 @@ def new_state() -> dict:
         "schema_version": SCHEMA_VERSION,
         "models": {},
         "last_success": None,
-        "failure": {"consecutive_failures": 0, "streak_started": None},
+        "failure": {
+            "consecutive_failures": 0,
+            "streak_started": None,
+            "error_notified": False,
+        },
     }
 
 
@@ -540,7 +552,8 @@ def atomic_write_json(path: str, obj) -> None:
         raise
 
 
-def make_snapshot(model: dict, first_seen: str, notified_at: str | None) -> dict:
+def snapshot_fields(model: dict) -> dict:
+    """The API fields copied into the stored snapshot for a free model."""
     return {
         "id": model.get("id"),
         "name": model.get("name"),
@@ -548,10 +561,15 @@ def make_snapshot(model: dict, first_seen: str, notified_at: str | None) -> dict
         "context_length": model.get("context_length"),
         "architecture": model.get("architecture"),
         "expiration_date": model.get("expiration_date"),
-        "first_seen": first_seen,
-        "notified_at": notified_at,
-        "pending_removal": None,
     }
+
+
+def make_snapshot(model: dict, first_seen: str, notified_at: str | None) -> dict:
+    snapshot = snapshot_fields(model)
+    snapshot["first_seen"] = first_seen
+    snapshot["notified_at"] = notified_at
+    snapshot["pending_removal"] = None
+    return snapshot
 
 
 # --------------------------------------------------------------------------- #
@@ -665,6 +683,7 @@ class Checker:
             failure = {}
         failure.setdefault("consecutive_failures", 0)
         failure.setdefault("streak_started", None)
+        failure.setdefault("error_notified", False)
         raw["failure"] = failure
         return raw
 
@@ -747,9 +766,15 @@ class Checker:
         if self._sanity_gate(len(data), total_count):
             return interval
 
-        if self.state["failure"]["consecutive_failures"] > 0:
-            self._send_recovery()
-            self.state["failure"] = {"consecutive_failures": 0, "streak_started": None}
+        failure = self.state["failure"]
+        if failure["consecutive_failures"] > 0:
+            # Only clear the streak once recovery is actually delivered (or was
+            # disabled); a failed recovery POST leaves the streak intact so the
+            # next successful cycle retries it.
+            if self._send_recovery():
+                failure["consecutive_failures"] = 0
+                failure["streak_started"] = None
+                failure["error_notified"] = False
 
         free = compute_free_set(data, self.cfg)
         all_by_id = {
@@ -815,8 +840,6 @@ class Checker:
         if failure["consecutive_failures"] == 0:
             failure["streak_started"] = self.cycle_ts
         failure["consecutive_failures"] += 1
-        first_of_streak = failure["consecutive_failures"] == 1
-        notify = self.cfg["discord"]["error_notify"] == "every" or first_of_streak
         logger.warning(
             "models API failure #%d (%s %s): %s",
             failure["consecutive_failures"],
@@ -824,8 +847,13 @@ class Checker:
             error.error_code,
             error.error_message,
         )
-        if notify:
+        if self.cfg["discord"]["error_notify"] == "every":
             self._send_error(error)
+        elif not failure["error_notified"]:
+            # "once": notify on the first delivered warning of the streak. Only
+            # mark it sent after a 2xx, so a failed warning is retried next cycle.
+            if self._send_error(error):
+                failure["error_notified"] = True
         self.append_history(
             "error",
             detail=f"{error.error_type} {error.error_code}".strip(),
@@ -850,7 +878,9 @@ class Checker:
             notify,
         )
         if notify:
-            self._send_new_batch([(model_id, free[model_id]) for model_id in sorted(free)])
+            self._send_batch(
+                [("new", model_id, free[model_id]) for model_id in sorted(free)]
+            )
         else:
             self.save_state()
 
@@ -879,26 +909,33 @@ class Checker:
         if removed_items:
             self.save_state()
 
-        self._send_new_batch(new_items)
-        self._send_removed_batch(removed_items)
+        # One ordered batch: all new models first, then all removals, each group
+        # alphabetical by id. The inter-message gap applies across the group
+        # boundary too, so the whole run is spaced uniformly.
+        batch = [("new", model_id, model) for model_id, model in new_items]
+        batch += [
+            ("removed", model_id, entry, reason)
+            for model_id, entry, reason in removed_items
+        ]
+        self._send_batch(batch)
 
     # -- notification batches --------------------------------------------- #
 
 
-    def _send_new_batch(self, items: list) -> None:
-        for index, (model_id, model) in enumerate(items):
-            if self.stop_flag["flag"]:
-                return
-            self._send_new(model_id, model)
-            if index < len(items) - 1:
-                if self._sleep(MESSAGE_GAP_SECONDS):
-                    return
+    def _send_batch(self, items: list) -> None:
+        """Send an ordered list of messages, one second apart, stop-aware.
 
-    def _send_removed_batch(self, items: list) -> None:
-        for index, (model_id, entry, reason) in enumerate(items):
+        Each item is ``("new", model_id, model)`` or
+        ``("removed", model_id, entry, reason)``. The gap is slept between every
+        pair of consecutive messages, including across the new/removed boundary.
+        """
+        for index, item in enumerate(items):
             if self.stop_flag["flag"]:
                 return
-            self._send_removed(model_id, entry, reason)
+            if item[0] == "new":
+                self._send_new(item[1], item[2])
+            else:
+                self._send_removed(item[1], item[2], item[3])
             if index < len(items) - 1:
                 if self._sleep(MESSAGE_GAP_SECONDS):
                     return
@@ -921,18 +958,9 @@ class Checker:
         if entry is None:
             self.state["models"][model_id] = make_snapshot(model, now, now)
         else:
-            entry.update(
-                {
-                    "id": model.get("id"),
-                    "name": model.get("name"),
-                    "description": model.get("description"),
-                    "context_length": model.get("context_length"),
-                    "architecture": model.get("architecture"),
-                    "expiration_date": model.get("expiration_date"),
-                    "notified_at": now,
-                    "pending_removal": None,
-                }
-            )
+            entry.update(snapshot_fields(model))
+            entry["notified_at"] = now
+            entry["pending_removal"] = None
             entry.setdefault("first_seen", now)
         self.append_history("added", model_id=model_id)
         self.save_state()
@@ -961,6 +989,29 @@ class Checker:
     # -- payload construction --------------------------------------------- #
 
 
+    def _base_context(self, icon: str) -> dict:
+        """The full 13-key template context, all values empty except ``icon``.
+
+        Every send helper starts from this so all placeholders are always
+        defined (``string.Template`` is rendered without strict mode); each
+        caller overrides only the keys it actually uses.
+        """
+        return {
+            "icon": icon,
+            "id": "",
+            "name": "",
+            "context_length": "",
+            "modalities": "",
+            "summary": "",
+            "url": "",
+            "reason": "",
+            "error_type": "",
+            "error_code": "",
+            "error_message": "",
+            "downtime": "",
+            "failed_cycles": "",
+        }
+
     def _model_context(self, model: dict, icon: str, reason: str = "") -> dict:
         model_id = model.get("id") or ""
         description = model.get("description")
@@ -969,21 +1020,21 @@ class Checker:
         name = model.get("name")
         if not isinstance(name, str):
             name = ""
-        return {
-            "icon": icon,
-            "id": str(model_id),
-            "name": escape_backticks(name),
-            "context_length": format_int(model.get("context_length")),
-            "modalities": format_modalities(model.get("architecture")),
-            "summary": escape_backticks(truncate_words(description, SUMMARY_LIMIT)),
-            "url": f"{MODEL_URL_PREFIX}{model_id}",
-            "reason": reason,
-            "error_type": "",
-            "error_code": "",
-            "error_message": "",
-            "downtime": "",
-            "failed_cycles": "",
-        }
+        context = self._base_context(icon)
+        context.update(
+            {
+                "id": str(model_id),
+                "name": escape_backticks(name),
+                "context_length": format_int(model.get("context_length")),
+                "modalities": format_modalities(model.get("architecture")),
+                "summary": escape_backticks(
+                    truncate_words(description, SUMMARY_LIMIT)
+                ),
+                "url": f"{MODEL_URL_PREFIX}{model_id}",
+                "reason": reason,
+            }
+        )
+        return context
 
     def _model_fields(self, model: dict) -> list:
         fields = []
@@ -1029,21 +1080,10 @@ class Checker:
 
     def _send_error(self, error: FetchError) -> bool:
         icon = self.cfg["icons"]["error"]
-        context = {
-            "icon": icon,
-            "id": "",
-            "name": "",
-            "context_length": "",
-            "modalities": "",
-            "summary": "",
-            "url": "",
-            "reason": "",
-            "error_type": error.error_type,
-            "error_code": error.error_code,
-            "error_message": error.error_message,
-            "downtime": "",
-            "failed_cycles": "",
-        }
+        context = self._base_context(icon)
+        context["error_type"] = error.error_type
+        context["error_code"] = error.error_code
+        context["error_message"] = error.error_message
         body = render_template(self.templates["error.txt"], context)
         payload = self._build_status_payload(
             icon,
@@ -1064,26 +1104,13 @@ class Checker:
             downtime = humanize_duration((now - started).total_seconds())
         else:
             downtime = humanize_duration(0)
-        context = {
-            "icon": icon,
-            "id": "",
-            "name": "",
-            "context_length": "",
-            "modalities": "",
-            "summary": "",
-            "url": "",
-            "reason": "",
-            "error_type": "",
-            "error_code": "",
-            "error_message": "",
-            "downtime": downtime,
-            "failed_cycles": str(failed_cycles),
-        }
-        self.append_history(
-            "recovery",
-            detail=f"downtime={downtime} failed_cycles={failed_cycles}",
-        )
+        context = self._base_context(icon)
+        context["downtime"] = downtime
+        context["failed_cycles"] = str(failed_cycles)
+        detail = f"downtime={downtime} failed_cycles={failed_cycles}"
         if not self.cfg["discord"]["notify_recovery"]:
+            # Nothing to deliver; the streak may be closed.
+            self.append_history("recovery", detail=detail)
             return True
         body = render_template(self.templates["recovery.txt"], context)
         payload = self._build_status_payload(
@@ -1092,7 +1119,10 @@ class Checker:
             body,
             self.cfg["colors"]["new_int"],
         )
-        return self._post(payload)
+        if not self._post(payload):
+            return False
+        self.append_history("recovery", detail=detail)
+        return True
 
     def _build_status_payload(
         self,
