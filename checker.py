@@ -36,6 +36,8 @@ SCHEMA_VERSION = 1
 USER_AGENT = "FreeModelChecker/1.0"
 MODEL_URL_PREFIX = "https://openrouter.ai/"
 RETRY_AFTER_ATTEMPTS = 5
+# Default spacing between consecutive Discord sends; also the granularity at
+# which long sleeps are broken up so a stop request is honoured promptly.
 MESSAGE_GAP_SECONDS = 1.0
 SUMMARY_LIMIT = 280
 ERROR_MESSAGE_LIMIT = 500
@@ -81,6 +83,7 @@ DEFAULT_CONFIG = {
         "error_notify": "once",
         "notify_recovery": True,
         "notify_on_first_run": True,
+        "message_gap_seconds": MESSAGE_GAP_SECONDS,
     },
     "icons": {
         "new": "\U0001f195",
@@ -415,6 +418,10 @@ def _validate_config(cfg: dict) -> None:
     for key in ("notify_recovery", "notify_on_first_run"):
         if not isinstance(discord.get(key), bool):
             raise ConfigError(f"[discord].{key} must be a boolean")
+    gap = discord.get("message_gap_seconds")
+    if isinstance(gap, bool) or not isinstance(gap, (int, float)) or gap < 0:
+        raise ConfigError("[discord].message_gap_seconds must be a number >= 0")
+    discord["message_gap_seconds"] = float(gap)
 
     icons = cfg["icons"]
     for key in ("new", "removed", "error", "recovery"):
@@ -921,12 +928,14 @@ class Checker:
 
 
     def _send_batch(self, items: list) -> None:
-        """Send an ordered list of messages, one second apart, stop-aware.
+        """Send an ordered list of messages, spaced, stop-aware.
 
         Each item is ``("new", model_id, model)`` or
         ``("removed", model_id, entry, reason)``. The gap is slept between every
         pair of consecutive messages, including across the new/removed boundary.
+        The gap is ``[discord].message_gap_seconds`` (default 1.0; 0 disables it).
         """
+        gap = self.cfg["discord"]["message_gap_seconds"]
         for index, item in enumerate(items):
             if self.stop_flag["flag"]:
                 return
@@ -934,8 +943,8 @@ class Checker:
                 self._send_new(item[1], item[2])
             else:
                 self._send_removed(item[1], item[2], item[3])
-            if index < len(items) - 1:
-                if self._sleep(MESSAGE_GAP_SECONDS):
+            if index < len(items) - 1 and gap > 0:
+                if self._sleep(gap):
                     return
 
     def _send_new(self, model_id: str, model: dict) -> bool:
@@ -1155,7 +1164,7 @@ class Checker:
             if result["status"] == 429:
                 wait = result["retry_after"]
                 if wait is None:
-                    wait = MESSAGE_GAP_SECONDS
+                    wait = self.cfg["discord"]["message_gap_seconds"]
                 logger.info(
                     "Discord rate limit (429); waiting %.1fs before retrying", wait
                 )

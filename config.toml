@@ -36,6 +36,10 @@ username = "Free Model Checker"
 error_notify = "once"
 notify_recovery = true
 notify_on_first_run = true
+# Seconds to wait between consecutive Discord messages in a batch (new models
+# then removals). Raise it to stay well clear of webhook rate limits; 0 disables
+# the gap entirely (not recommended).
+message_gap_seconds = 1.0
 
 [icons]
 new = "🆕"

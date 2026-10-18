@@ -97,7 +97,7 @@ Verified API facts that shaped this design (live, 2026-10-18):
 
 46. As an operator, I want one plain log line per event on stdout, readable with `docker compose logs -f`, so that I can watch cycles without tooling.
 47. As an operator, I want the container to run as a non-root user with `restart: unless-stopped`, so that the service is safe and self-healing.
-48. As an operator, I want the service to honor HTTP 429 with `retry_after` when sending Discord messages, interspersed with a 1-second gap between messages in a batch, so that a burst of changes never gets rate-limited into silent loss.
+48. As an operator, I want the service to honor HTTP 429 with `retry_after` when sending Discord messages, interspersed with a configurable gap (`message_gap_seconds`, 1 second by default) between messages in a batch, so that a burst of changes never gets rate-limited into silent loss.
 49. As a maintainer, I want zero third-party Python dependencies, so that image updates are trivial and the build is fast.
 50. As a maintainer, I want a README covering build, compose usage, Discord webhook setup, the full config reference, persistence, template editing, interval syntax, first-run behavior, and troubleshooting, so that the stack can be redeployed on a new machine from scratch.
 
@@ -120,6 +120,7 @@ Verified API facts that shaped this design (live, 2026-10-18):
               error_notify = "once"      # once | every
               notify_recovery = true
               notify_on_first_run = true
+              message_gap_seconds = 1.0  # spacing between sends; 0 disables
   [icons]     new = "🆕"; removed = "❌"; error = "⚠️"; recovery = "✅"
   [colors]    new = "#2ECC71"; removed = "#E74C3C"; error = "#F1C40F"
   ```
@@ -129,7 +130,7 @@ Verified API facts that shaped this design (live, 2026-10-18):
 - **Loop**: `fetch → guards → diff → notify → persist → sleep(interval)`. Interval parser accepts `<n><m|h|d>` and bare seconds. Runs once immediately when `run_on_start`. A cycle cannot overlap itself; sleep runs after the work completes.
 - **Guards** (all abort the cycle, send no removals): fetch exception/timeout; non-2xx HTTP; unparseable JSON; empty `data`; and when the sanity gate is enabled, `len(data)` or `total_count` below `sanity_min_fraction` of the last successful cycle's values (log warning only, no Discord message for this guard).
 - **Error streak state machine**: failures increment `consecutive_failures`; the first failure of a streak sends ⚠️ when `error_notify = "once"` (every failure sends when `"every"`); any successful cycle with `consecutive_failures > 0` sends ✅ (when `notify_recovery`) carrying `${downtime}` (humanized wall time) and the failed-cycle count, then resets the counter. Failed cycles sleep `retry_delay` instead of `interval`.
-- **Notification pipeline**: build message list as new models first, then removals, each alphabetical by ID; one message per model; 1-second spacing between sends; on HTTP 429 sleep `retry_after` from the response body and retry that message; a message's `notified_at` in state is written only after a 2xx; on other send failures log to stderr and leave `notified_at` unset so the next cycle retries.
+- **Notification pipeline**: build message list as new models first, then removals, each alphabetical by ID; one message per model; `message_gap_seconds` spacing between sends (default 1 second, `0` disables); on HTTP 429 sleep `retry_after` from the response body (falling back to `message_gap_seconds`) and retry that message; a message's `notified_at` in state is written only after a 2xx; on other send failures log to stderr and leave `notified_at` unset so the next cycle retries.
 - **State schema** (`data/state.json`): `schema_version`, `models` keyed by ID with snapshot fields (`id`, `name`, `description`, `context_length`, `architecture`, `expiration_date`), `first_seen`, `notified_at`; plus `last_success` (`timestamp`, `data_len`, `total_count`) for the sanity gate and `failure` streak bookkeeping (`consecutive_failures`, `streak_started`). Writes are atomic (temp file + rename). `data/history.jsonl` appends one JSON object per event: `{"ts", "event", "id"?, "reason"?, "detail"?}`.
 - **Embed contract**: `title` = `${icon} ${name}` (with icon+color per event type); `url` = `https://openrouter.ai/<id>`; `description` = rendered template body; inline fields = Context length (comma-separated digits + " tokens"), Modalities (formatted `text + image → text` from `architecture.modality`), Free until (only when `expiration_date` exists); `timestamp` = cycle time in UTC ISO-8601; `username` override on the webhook payload. Removal embeds reuse snapshot fields. Error/recovery embeds use their own templates with ${error_*} / ${downtime} placeholders.
 - **Truncation**: summary at ~280 chars on a word boundary + `…`; error message ~500 chars; final embed description capped at 4096 and plain content at 2000 characters as a safety net. Descriptions may contain backticks, so escaping is applied before embedding.

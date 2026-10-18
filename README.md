@@ -104,6 +104,7 @@ docker compose up -d --build
 | `error_notify` | `"once"` | `once` notifies on the first failure of a streak only; `every` notifies on every failed cycle (useful while debugging). |
 | `notify_recovery` | `true` | Send a ✅ message once the API works again, reporting the outage duration and failed-cycle count. |
 | `notify_on_first_run` | `true` | On an empty/missing state file, announce every current free model as 🆕. Set `false` to seed silently (e.g. after wiping the volume). |
+| `message_gap_seconds` | `1.0` | Seconds to wait between consecutive Discord sends in a batch. The gap applies across the new→removed boundary too. Raise it to stay clear of webhook rate limits; `0` disables the gap (a burst of changes then goes out back-to-back, which is what gets webhooks throttled or blocked). |
 
 ### `[icons]`
 
@@ -258,7 +259,7 @@ Errors (fetch failures, Discord send failures, guard warnings) are written to **
 
 **Non-zero exit on bad configuration.** If `config.toml` is missing or invalid, or `DISCORD_WEBHOOK_URL` is unset/empty, the process logs a clear line and exits non-zero instead of running blind. With `restart: unless-stopped` Compose will keep restarting it — check the logs, fix `.env`/`config.toml`, then `docker compose up -d` again.
 
-**Discord 429 (rate limited).** If the webhook returns HTTP 429, the checker reads `retry_after` from the response (the `Retry-After` header is preferred, falling back to the JSON body's `retry_after` field), sleeps that long, and retries the *same* message. Messages in a batch are also spaced 1 second apart. A burst of changes is therefore throttled, not lost.
+**Discord 429 (rate limited).** If the webhook returns HTTP 429, the checker reads `retry_after` from the response (the `Retry-After` header is preferred, falling back to the JSON body's `retry_after` field), sleeps that long, and retries the *same* message. Messages in a batch are also spaced by `[discord].message_gap_seconds` (1 second by default). A burst of changes is therefore throttled, not lost.
 
 **Other Discord send failures.** A non-429 send failure is logged to stderr and the message is *not* marked notified, so the next cycle retries it. Fix the webhook URL and the backlog clears itself.
 
