@@ -1,0 +1,11 @@
+services:
+  free-model-checker:
+    build: .
+    image: free-model-checker:latest
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - TZ=${TZ:-UTC}
+    volumes:
+      - ./data:/app/data
+      - ./templates:/app/templates:ro
