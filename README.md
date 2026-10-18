@@ -63,7 +63,13 @@ Notifications are delivered to a channel webhook on a **private** server only yo
 
 ## Configuration reference
 
-All non-secret settings live in `config.toml` (mounted read-only into the container). Secrets live only in `.env`. Edit `config.toml`, then `docker compose restart` to apply — no rebuild needed.
+All non-secret settings live in `config.toml`, which is copied into the image at build time. Secrets live only in `.env`. Edit `config.toml`, then rebuild and restart to apply:
+
+```sh
+docker compose up -d --build
+```
+
+(Template prose is the part you can change with only a restart — see [Templates](#templates).)
 
 ### `[api]`
 
@@ -85,7 +91,7 @@ All non-secret settings live in `config.toml` (mounted read-only into the contai
 | Key | Default | Meaning |
 |---|---|---|
 | `mode` | `"zero_price"` | How "free" is defined: `zero_price` (`pricing.prompt == "0"` and `pricing.completion == "0"`), `suffix` (`id` ends with `:free`), or `either` (union of both). |
-| `text_only` | `true` | Drop models whose `architecture.output_modalities` lacks `text`, so audio-only models (e.g. the Lyria pair) never notify you even when zero-priced. |
+| `text_only` | `true` | Keep only models whose `architecture.output_modalities` is exactly `["text"]`. Mixed-modality zero-priced models such as the Lyria pair (`text`+`audio`) never notify you. |
 | `blacklist` | `["openrouter/*"]` | fnmatch globs matched against the model `id`; matches are ignored entirely. The default hides OpenRouter's `openrouter/free` auto-router, which is not a model. |
 | `sanity_min_fraction` | `0.5` | Skip a cycle (log a warning, send no messages) when the model count or `total_count` drops below this fraction of the last successful cycle. `0` disables the guard. |
 
@@ -256,7 +262,7 @@ Errors (fetch failures, Discord send failures, guard warnings) are written to **
 
 **Other Discord send failures.** A non-429 send failure is logged to stderr and the message is *not* marked notified, so the next cycle retries it. Fix the webhook URL and the backlog clears itself.
 
-**Sanity-gate warnings.** A log line about the model count dropping below the sanity fraction means the cycle was **skipped**: a fetch succeeded but the response looked truncated (fewer models, or a lower `total_count`, than half of the last successful cycle). No Discord message is sent and the free set is left untouched, so a partial response can never be mistaken for mass removal. If you legitimately expect the catalog to shrink that much (or you are testing against a tiny mock), set `sanity_min_fraction = 0` in `config.toml` to disable the guard, then `docker compose restart`.
+**Sanity-gate warnings.** A log line about the model count dropping below the sanity fraction means the cycle was **skipped**: a fetch succeeded but the response looked truncated (fewer models, or a lower `total_count`, than half of the last successful cycle). No Discord message is sent and the free set is left untouched, so a partial response can never be mistaken for mass removal. If you legitimately expect the catalog to shrink that much (or you are testing against a tiny mock), set `sanity_min_fraction = 0` in `config.toml` to disable the guard, then `docker compose up -d --build`.
 
 **Empty or failed responses.** An empty `data` array, a non-2xx status, a timeout, or unparseable JSON all abort the cycle without removals. Failures increment the streak counter and retry after `retry_delay` (not the full interval) so recovery is quick. With `error_notify = "once"` you get one ⚠️ per streak; the following successful cycle sends one ✅ with downtime and the failed-cycle count.
 
@@ -283,4 +289,4 @@ There is no test framework; behavior is verified by running the stack against a 
 7. **Break the webhook URL** → a stderr line and no crash; fix the URL and the message is retried on the next cycle.
 8. **Set `message_format = "plain"`** → the same content arrives as markdown text with no embed.
 
-Only externally observable behavior counts as evidence: channels messages, stdout/stderr, and the contents of `data/`.
+Only externally observable behavior counts as evidence: channel messages, stdout/stderr, and the contents of `data/`.

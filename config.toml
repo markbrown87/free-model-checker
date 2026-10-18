@@ -18,7 +18,8 @@ retry_delay = "5m"
 [detection]
 # zero_price | suffix | either
 mode = "zero_price"
-# Drop models whose architecture.output_modalities lacks "text".
+# Keep only models whose output modalities are exactly ["text"]; drops
+# mixed-modality models (e.g. the Lyria pair, which output text+audio).
 text_only = true
 # fnmatch globs against the model id; matches are ignored entirely.
 blacklist = ["openrouter/*"]
