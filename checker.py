@@ -721,7 +721,6 @@ class Checker:
         self.state = self.load_state()
         self.first_run = not self.state.get("models")
         interval = self.cfg["schedule"]["_interval_seconds"]
-        retry = self.cfg["schedule"]["_retry_seconds"]
         delay = 0.0 if self.cfg["schedule"]["run_on_start"] else float(interval)
         logger.info(
             "free-model-checker started (interval=%ss, run_on_start=%s, mode=%s)",
@@ -751,7 +750,6 @@ class Checker:
     def cycle(self) -> int:
         """Run one cycle; returns the number of seconds to sleep afterwards."""
         self.cycle_ts = utc_now_iso()
-        retry = self.cfg["schedule"]["_retry_seconds"]
         interval = self.cfg["schedule"]["_interval_seconds"]
 
         try:
