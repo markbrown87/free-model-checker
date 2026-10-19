@@ -3,6 +3,15 @@
     "models": {
       "zephyr-1-free": {
         "name": "Zephyr 1 Free",
+        "description": "A tiny zero-priced text model used to exercise the OpenCode free set and its models.dev enrichment.",
+        "limit": {
+          "context": 262144,
+          "output": 131072
+        },
+        "modalities": {
+          "input": ["text"],
+          "output": ["text"]
+        },
         "cost": {
           "input": 0,
           "output": 0
@@ -10,6 +19,15 @@
       },
       "big-pickle": {
         "name": "Big Pickle",
+        "description": "An unsuffixed stealth model the registry already prices at zero.",
+        "limit": {
+          "context": 1048576,
+          "output": 131072
+        },
+        "modalities": {
+          "input": ["text"],
+          "output": ["text"]
+        },
         "cost": {
           "input": 0,
           "output": 0
@@ -17,6 +35,14 @@
       },
       "premium-x": {
         "name": "Premium X",
+        "limit": {
+          "context": 131072,
+          "output": 8192
+        },
+        "modalities": {
+          "input": ["text"],
+          "output": ["text"]
+        },
         "cost": {
           "input": 3,
           "output": 15

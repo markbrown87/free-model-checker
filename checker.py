@@ -592,6 +592,49 @@ def is_opencode_free(model_id: str, catalog: dict) -> bool:
     return is_zero_cost(catalog.get(model_id))
 
 
+def model_from_catalog(model_id: str, entry) -> dict:
+    """Build a snapshot-shaped model from a models.dev catalog entry.
+
+    models.dev nests the display data differently from the OpenRouter payload
+    the rest of the checker consumes (``limit.context`` and
+    ``modalities.input/output`` rather than ``context_length`` and
+    ``architecture``), so translate to that shape here. Falls back to an
+    identifier-only model when the registry has no entry (e.g. a brand-new
+    stealth model) or omits a field.
+    """
+    model: dict = {"id": model_id}
+    if not isinstance(entry, dict):
+        return model
+
+    name = entry.get("name")
+    if isinstance(name, str) and name:
+        model["name"] = name
+
+    description = entry.get("description")
+    if isinstance(description, str) and description:
+        model["description"] = description
+
+    limit = entry.get("limit")
+    if isinstance(limit, dict):
+        context_length = limit.get("context")
+        if isinstance(context_length, (int, float)) and not isinstance(
+            context_length, bool
+        ):
+            model["context_length"] = context_length
+
+    modalities = entry.get("modalities")
+    if isinstance(modalities, dict):
+        inputs = modalities.get("input") or []
+        outputs = modalities.get("output") or []
+        if inputs or outputs:
+            model["architecture"] = {
+                "input_modalities": inputs,
+                "output_modalities": outputs,
+            }
+
+    return model
+
+
 class Detection:
     """The result of one provider's fetch+detection pass.
 
@@ -696,9 +739,10 @@ def _detect_opencode(checker: "Checker", provider: Provider, api_key: str) -> De
     for model_id in live:
         if is_opencode_free(model_id, catalog):
             # OpenCode's payload carries no name/description/architecture, so
-            # the snapshot is identifier-only and the display name falls back
-            # to the id.
-            free[model_id] = {"id": model_id}
+            # enrich the snapshot from the models.dev entry the free set is
+            # derived from. Models missing from the registry stay id-only and
+            # the display name falls back to the id.
+            free[model_id] = model_from_catalog(model_id, catalog.get(model_id))
 
     def reason(model_id: str) -> str:
         if model_id not in live:
@@ -775,6 +819,20 @@ def make_snapshot(model: dict, first_seen: str, notified_at: str | None) -> dict
     snapshot["notified_at"] = notified_at
     snapshot["pending_removal"] = None
     return snapshot
+
+
+def backfill_snapshot(entry: dict, model: dict) -> None:
+    """Refresh a tracked snapshot's display fields from fresh provider data.
+
+    Only non-empty values overwrite, so a provider (or, for OpenCode, the
+    models.dev catalog) that stops publishing a field never blanks a good
+    snapshot. Bookkeeping keys (``first_seen``/``notified_at``/
+    ``pending_removal``) are left untouched.
+    """
+    for key, value in snapshot_fields(model).items():
+        if value is None or value == "" or value == [] or value == {}:
+            continue
+        entry[key] = value
 
 
 # --------------------------------------------------------------------------- #
@@ -1211,8 +1269,13 @@ class Checker:
             entry = source["models"].get(model_id)
             if entry is None or entry.get("notified_at") is None:
                 news.append((model_id, detection.free[model_id]))
-            elif entry.get("pending_removal"):
-                entry["pending_removal"] = None
+            else:
+                if entry.get("pending_removal"):
+                    entry["pending_removal"] = None
+                # A model still in the free set may have gained fields the
+                # provider now publishes (e.g. OpenCode after the models.dev
+                # catalog enriched it), so refresh its tracked snapshot.
+                backfill_snapshot(entry, detection.free[model_id])
 
         removals = []
         for model_id in sorted(source["models"]):

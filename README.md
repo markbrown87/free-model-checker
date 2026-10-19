@@ -246,7 +246,7 @@ Free detection is exactly as before and is fully configurable via `[providers.op
 OpenCode's models endpoint publishes only `id`/`object`/`created`/`owned_by` — **no pricing, name, description, or architecture** — and there is no per-model detail endpoint. To keep detection fully automatic with no hand-maintained list, the checker combines two sources:
 
 - **Availability** comes from the OpenCode models endpoint (`[providers.opencode].url`). This live list is authoritative: models that exist only in the registry but are not currently served never produce false alarms.
-- **Pricing truth** comes from the **models.dev** registry (`[providers.opencode].catalog_url`), under `api.json["opencode"]["models"]`. models.dev is the registry OpenCode itself uses to populate its model picker, making it the most trustworthy pricing source available.
+- **Pricing truth (and display data)** comes from the **models.dev** registry (`[providers.opencode].catalog_url`), under `api.json["opencode"]["models"]`. models.dev is the registry OpenCode itself uses to populate its model picker, making it the most trustworthy pricing source available.
 
 A model is free when it is **currently served** *and* either its `id` ends in `-free` **or** the registry reports zero input **and** output cost:
 
@@ -256,11 +256,22 @@ free(id) = id ∈ live AND ( id ends with "-free" OR ( catalog[id].cost.input ==
 
 There is deliberately **no suffix-only fallback** — if a model is served but the registry is missing or does not price it, treating it as free would later report a false removal. Suffix-named promos (`jev-1.13-free`) and unsuffixed stealth models the registry already prices at zero (`big-pickle`) are both caught; the junk `test` entry is excluded automatically because it is neither `-free` nor zero-cost. There is **no `blacklist`** for OpenCode because detection already excludes everything non-free.
 
+**Snapshot enrichment.** Because the live payload is sparse, the models.dev entry the free set is already derived from also fills the message snapshot, so OpenCode messages carry the same display data as OpenRouter's. The registry nests this under different keys, so the checker maps them onto the provider-neutral snapshot shape:
+
+| Snapshot field | models.dev source |
+|---|---|
+| `name` | `name` |
+| `description` | `description` |
+| `context_length` | `limit.context` |
+| `architecture` | `modalities.input` / `modalities.output` |
+
+A model that is served but has no registry entry (or one that omits a field) stays identifier-only rather than failing — the display name falls back to the ID and the context-length/modality fields are simply omitted. Tracked snapshots are **backfilled** on each successful cycle: a model that stays free has its display fields refreshed from the catalog without re-notifying, so upgrading an existing deployment fills in already-seeded entries on the next cycle. There is no models.dev equivalent for OpenRouter's `expiration_date`, so OpenCode messages never show a **Free until** field.
+
 **Catalog fetching.** While the provider is enabled, the catalog is fetched once per cycle with a conditional GET (`If-None-Match` with the cached ETag). A `304 Not Modified` reuses the in-memory cache; a `200` replaces it. The first cycle full-fetches (a restart refetches once). The cache is process-local, so repeated cycles do not re-download the multi-megabyte registry.
 
 **Failure is a failed cycle.** If either the live list or the catalog fetch fails, that is **that provider's failed cycle**: no diff, no messages, retried after `retry_delay`. A degraded definition can therefore never emit false removals.
 
-**Residual gap.** A brand-new stealth model that is served but has neither a `-free` suffix nor a models.dev entry yet is not detected until the registry catches up. This is the accepted cost of never maintaining a list.
+**Residual gap.** A brand-new stealth model that is served but has neither a `-free` suffix nor a models.dev entry yet is not detected until the registry catches up. A model detected purely by its `-free` suffix but missing from the registry is announced id-only (no name/context/modalities) until the registry adds it. This is the accepted cost of never maintaining a list.
 
 ## Interval syntax
 
@@ -295,7 +306,7 @@ Placeholders available to every template:
 | `${icon}` | Event icon from `[icons]`. |
 | `${source}` | Provider display name (`OpenRouter` or `OpenCode`). Added to all four templates. |
 | `${id}` | Model ID (raw). |
-| `${name}` | Model name (Discord-escaped); falls back to the ID when the provider supplies no name (typical for OpenCode). |
+| `${name}` | Model name (Discord-escaped); falls back to the ID when the model is not in the models.dev registry (OpenCode) or the provider supplies no name. |
 | `${context_length}` | Comma-formatted digits, e.g. `262,144`. |
 | `${modalities}` | Formatted modality, e.g. `text + image → text`. |
 | `${summary}` | `description` truncated at ~280 characters on a word boundary + `…` (Discord-escaped). |
@@ -348,12 +359,12 @@ Each event type has its own icon and colour. New and removal embeds are titled `
 
 | Event | Icon | Colour | Contents |
 |---|---|---|---|
-| New free model | 🆕 | Green (`#2ECC71`) | Title `${icon} [${source}] ${name-or-id}`; body rendered from `new_model.txt`; inline fields **Context length** (`<digits> tokens`) and **Modalities** (`text + image → text`) only when the provider supplies them, and **Free until** only when the API reports `expiration_date`. |
+| New free model | 🆕 | Green (`#2ECC71`) | Title `${icon} [${source}] ${name-or-id}`; body rendered from `new_model.txt`; inline fields **Context length** (`<digits> tokens`) and **Modalities** (`text + image → text`) when the provider (or, for OpenCode, the models.dev registry) supplies them, and **Free until** only when the API reports `expiration_date` (OpenRouter only). |
 | Model leaves free set | ❌ | Red (`#E74C3C`) | Title `${icon} [${source}] ${name-or-id}`; body rendered from `removed_model.txt` (snapshot fields, so details survive after the model is gone). |
 | API error | ⚠️ | Yellow (`#F1C40F`) | Title `${icon} ${source} models API error`; body rendered from `error.txt` with error type, code, and detail; inline **Error** field (`<type> <code>`). No URL. |
 | Recovery | ✅ | Green (`#2ECC71`) | Title `${icon} ${source} models API recovered`; body rendered from `recovery.txt` with downtime and failed-cycle count. No URL. |
 
-Because OpenCode's payload is sparse (id only), its messages are **identifier-first**: the title falls back to the ID and the context-length/modality fields are omitted, yielding a clean message with the `Source:` line.
+OpenCode's live payload is sparse (id only), but its messages are **not** identifier-first: the models.dev registry supplies the name, description, context length, and modalities, so an OpenCode 🆕/❌ reads like an OpenRouter one. Only models missing from the registry (and **Free until**, which models.dev does not publish) fall back to the id-only form.
 
 Every embed carries a detection timestamp (UTC in the payload, localized by Discord) and the webhook display name from `[discord].username`.
 
@@ -363,7 +374,7 @@ With `message_format = "plain"`, the same rendered body (including the `Source:`
 
 All runtime state lives in the bind-mounted `./data` directory and survives restarts, rebuilds, and `docker compose down`:
 
-- **`data/state.json`** — human-readable JSON, **schema v2**, with one section per provider keyed by display name. Each section holds `models` (the current free set keyed by model ID, each with a snapshot of the provider's fields — `id`, `name`, `description`, `context_length`, `architecture`, `expiration_date` — plus `first_seen`, `notified_at`, and `pending_removal` bookkeeping), `last_success` (for the sanity gate), and `failure` (streak counters). Writes are atomic (temp file + rename), so an interrupted write never corrupts it.
+- **`data/state.json`** — human-readable JSON, **schema v2**, with one section per provider keyed by display name. Each section holds `models` (the current free set keyed by model ID, each with a snapshot of the provider's fields — `id`, `name`, `description`, `context_length`, `architecture`, `expiration_date` — plus `first_seen`, `notified_at`, and `pending_removal` bookkeeping; free models that stay free have their display fields backfilled from the provider, or for OpenCode from models.dev, on each successful cycle), `last_success` (for the sanity gate), and `failure` (streak counters). Writes are atomic (temp file + rename), so an interrupted write never corrupts it.
 
   ```json
   {
@@ -462,7 +473,7 @@ tools/fixtures/
   openrouter/models.json     # {"data":[...], "total_count": N}
   openrouter/empty.json      # {"data":[], "total_count": 0}
   opencode/models.json       # {"object":"list","data":[{"id","object","created","owned_by"}]}
-  models.dev/api.json        # {"opencode":{"models":{"<id>":{...,"cost":{"input","output"}}}}}
+  models.dev/api.json        # {"opencode":{"models":{"<id>":{"name","description","limit":{"context"},"modalities":{"input","output"},"cost":{"input","output"}}}}}
 tools/test.config.toml       # points provider urls + catalog_url at the mock service, webhook at the fake webhook
 compose.test.yaml            # overlay: fake-webhook service + mock static-file service + test config mount + env
 ```
