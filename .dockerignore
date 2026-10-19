@@ -1,5 +1,8 @@
 .git
-data
 .env
 __pycache__
 *.md
+tools
+compose.test.yaml
+data/*
+!data/.gitkeep

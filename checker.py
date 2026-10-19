@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
 """free-model-checker.
 
-A single, dependency-free Python 3.12 process that polls the OpenRouter models
-API on an interval, computes the current set of models that cost $0 to use,
-diffs it against persisted state, and announces additions/removals to a Discord
-webhook using user-editable templates.
+A single, dependency-free Python 3.12 process that polls one or more
+code-supported model providers (OpenRouter, OpenCode) on an interval, computes
+each provider's current free set, diffs it against persisted per-provider state,
+and announces additions/removals to a Discord webhook using user-editable
+templates.
 
-Standard library only. See SPEC.md for the full behavior specification.
+Providers are first-class integrations implemented in code: the operator only
+enables them and may override their endpoints (useful for testing). OpenCode
+publishes no pricing of its own, so its free set is derived from the models.dev
+registry that OpenCode itself uses.
+
+Standard library only.
 """
 
 from __future__ import annotations
@@ -32,9 +38,8 @@ from datetime import datetime, timezone
 
 APP_DIR = "/app"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 USER_AGENT = "FreeModelChecker/1.0"
-MODEL_URL_PREFIX = "https://openrouter.ai/"
 RETRY_AFTER_ATTEMPTS = 5
 # Default spacing between consecutive Discord sends; also the granularity at
 # which long sleeps are broken up so a stop request is honoured promptly.
@@ -48,14 +53,14 @@ TITLE_LIMIT = 256
 # Baked-in default templates. These MUST be byte-identical to the files in
 # templates/ so the container still works when the bind mount is absent.
 DEFAULT_TEMPLATES = {
-    "new_model.txt": "`${id}`\n\n${summary}\n",
-    "removed_model.txt": "`${id}`\n\n${reason}\n",
+    "new_model.txt": "`${id}`\n\nSource: ${source}\n\n${summary}\n",
+    "removed_model.txt": "`${id}`\n\nSource: ${source}\n\n${reason}\n",
     "error.txt": (
-        "OpenRouter models API error: ${error_type} ${error_code}\n\n"
+        "${source} models API error: ${error_type} ${error_code}\n\n"
         "${error_message}\n"
     ),
     "recovery.txt": (
-        "The OpenRouter models API is responding again.\n\n"
+        "The ${source} models API is responding again.\n\n"
         "Downtime: ${downtime}\n"
         "Failed cycles: ${failed_cycles}\n"
     ),
@@ -63,19 +68,12 @@ DEFAULT_TEMPLATES = {
 
 DEFAULT_CONFIG = {
     "api": {
-        "url": "https://openrouter.ai/api/v1/models",
         "timeout_seconds": 30,
     },
     "schedule": {
         "interval": "1h",
         "run_on_start": True,
         "retry_delay": "5m",
-    },
-    "detection": {
-        "mode": "zero_price",
-        "text_only": True,
-        "blacklist": ["openrouter/*"],
-        "sanity_min_fraction": 0.5,
     },
     "discord": {
         "message_format": "embed",
@@ -95,6 +93,38 @@ DEFAULT_CONFIG = {
         "new": "#2ECC71",
         "removed": "#E74C3C",
         "error": "#F1C40F",
+    },
+}
+
+# Provider registry (code-level integrations). Each entry declares the display
+# name and the default value of every config key the provider understands. The
+# operator can only enable these providers and override their values; they can
+# never define new ones.
+PROVIDER_REGISTRY = {
+    "openrouter": {
+        "name": "OpenRouter",
+        "defaults": {
+            "enabled": True,
+            "url": "https://openrouter.ai/api/v1/models",
+            "api_key_env": "OPENROUTER_API_KEY",
+            "model_url": "https://openrouter.ai/{id}",
+            "sanity_min_fraction": 0.5,
+            "mode": "zero_price",
+            "suffix": ":free",
+            "text_only": True,
+            "blacklist": ["openrouter/*"],
+        },
+    },
+    "opencode": {
+        "name": "OpenCode",
+        "defaults": {
+            "enabled": True,
+            "url": "https://opencode.ai/inference/v1/models",
+            "catalog_url": "https://models.dev/api.json",
+            "api_key_env": "OPENCODE_API_KEY",
+            "model_url": "",
+            "sanity_min_fraction": 0.5,
+        },
     },
 }
 
@@ -119,7 +149,7 @@ class StateError(Exception):
 
 
 class FetchError(Exception):
-    """A classified models-API fetch failure."""
+    """A classified models-API or catalog fetch failure."""
 
     def __init__(self, error_type: str, error_code: str, error_message: str):
         super().__init__(f"{error_type} {error_code}: {error_message}")
@@ -361,14 +391,85 @@ def load_config(path: str) -> dict:
         for section, defaults in DEFAULT_CONFIG.items()
     }
 
+    cfg["providers"] = _load_providers(raw)
+
     _validate_config(cfg)
     return cfg
 
 
+def _load_providers(raw: dict) -> list:
+    """Validate the [providers] tables and return them in config order.
+
+    An absent [providers] table (or an absent per-provider table) disables that
+    provider; an unknown provider name is a hard error listing the supported
+    names, so a typo can never silently disable monitoring.
+    """
+    supplied = raw.get("providers")
+    if supplied is None:
+        return []
+    if not isinstance(supplied, dict):
+        raise ConfigError("[providers] must be a table")
+    unknown = [key for key in supplied if key not in PROVIDER_REGISTRY]
+    if unknown:
+        supported = ", ".join(sorted(PROVIDER_REGISTRY))
+        raise ConfigError(
+            f"unknown provider(s) {sorted(unknown)} under [providers]; "
+            f"supported providers: {supported}"
+        )
+    providers = []
+    for key, spec in ((k, v) for k, v in supplied.items()):
+        spec_defaults = PROVIDER_REGISTRY[key]["defaults"]
+        if not isinstance(spec, dict):
+            raise ConfigError(f"[providers.{key}] must be a table")
+        merged = dict(spec_defaults)
+        merged.update(spec)
+        merged["key"] = key
+        merged["name"] = PROVIDER_REGISTRY[key]["name"]
+        _validate_provider(key, merged)
+        providers.append(merged)
+    return providers
+
+
+def _validate_provider(key: str, provider: dict) -> None:
+    def bad(message: str) -> None:
+        raise ConfigError(f"[providers.{key}].{message}")
+
+    if not isinstance(provider.get("enabled"), bool):
+        bad("enabled must be a boolean")
+    url = provider.get("url")
+    if not isinstance(url, str) or not url.strip():
+        bad("url must be a non-empty string")
+    api_key_env = provider.get("api_key_env")
+    if not isinstance(api_key_env, str):
+        bad("api_key_env must be a string")
+    model_url = provider.get("model_url")
+    if not isinstance(model_url, str):
+        bad("model_url must be a string")
+    fraction = provider.get("sanity_min_fraction")
+    if isinstance(fraction, bool) or not isinstance(fraction, (int, float)) or fraction < 0:
+        bad("sanity_min_fraction must be a number >= 0")
+    provider["sanity_min_fraction"] = float(fraction)
+
+    if key == "openrouter":
+        if provider.get("mode") not in VALID_MODES:
+            bad(f"mode must be one of {sorted(VALID_MODES)}, got {provider.get('mode')!r}")
+        if not isinstance(provider.get("suffix"), str):
+            bad("suffix must be a string")
+        if not isinstance(provider.get("text_only"), bool):
+            bad("text_only must be a boolean")
+        blacklist = provider.get("blacklist")
+        if not isinstance(blacklist, list) or not all(
+            isinstance(item, str) for item in blacklist
+        ):
+            bad("blacklist must be a list of strings")
+    elif key == "opencode":
+        catalog_url = provider.get("catalog_url")
+        if not isinstance(catalog_url, str) or not catalog_url.strip():
+            bad("catalog_url must be a non-empty string")
+
+
 def _validate_config(cfg: dict) -> None:
     api = cfg["api"]
-    if not isinstance(api.get("url"), str) or not api["url"].strip():
-        raise ConfigError("[api].url must be a non-empty string")
     timeout = api.get("timeout_seconds")
     if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0:
         raise ConfigError("[api].timeout_seconds must be a positive number")
@@ -379,28 +480,6 @@ def _validate_config(cfg: dict) -> None:
     schedule["_retry_seconds"] = parse_interval(schedule.get("retry_delay"))
     if not isinstance(schedule.get("run_on_start"), bool):
         raise ConfigError("[schedule].run_on_start must be a boolean")
-
-    detection = cfg["detection"]
-    if detection.get("mode") not in VALID_MODES:
-        raise ConfigError(
-            f"[detection].mode must be one of {sorted(VALID_MODES)}, "
-            f"got {detection.get('mode')!r}"
-        )
-    if not isinstance(detection.get("text_only"), bool):
-        raise ConfigError("[detection].text_only must be a boolean")
-    blacklist = detection.get("blacklist")
-    if not isinstance(blacklist, list) or not all(
-        isinstance(item, str) for item in blacklist
-    ):
-        raise ConfigError("[detection].blacklist must be a list of strings")
-    fraction = detection.get("sanity_min_fraction")
-    if (
-        isinstance(fraction, bool)
-        or not isinstance(fraction, (int, float))
-        or fraction < 0
-    ):
-        raise ConfigError("[detection].sanity_min_fraction must be a number >= 0")
-    detection["sanity_min_fraction"] = float(fraction)
 
     discord = cfg["discord"]
     if discord.get("message_format") not in VALID_MESSAGE_FORMATS:
@@ -450,7 +529,7 @@ def load_templates(templates_dir: str) -> dict:
 
 
 # --------------------------------------------------------------------------- #
-# Detection
+# Providers
 # --------------------------------------------------------------------------- #
 
 
@@ -461,65 +540,181 @@ def is_zero_priced(pricing) -> bool:
     return pricing.get("prompt") == "0" and pricing.get("completion") == "0"
 
 
-def is_free_model(model: dict, mode: str) -> bool:
+def is_free_model(model: dict, mode: str, suffix: str) -> bool:
     model_id = model.get("id")
-    suffix = isinstance(model_id, str) and model_id.endswith(":free")
+    has_suffix = isinstance(model_id, str) and bool(suffix) and model_id.endswith(suffix)
     if mode == "suffix":
-        return suffix
+        return has_suffix
     zero_price = is_zero_priced(model.get("pricing"))
     if mode == "zero_price":
         return zero_price
-    return zero_price or suffix
+    return zero_price or has_suffix
 
 
-def compute_free_set(data: list, cfg: dict) -> dict:
-    detection = cfg["detection"]
-    mode = detection["mode"]
-    text_only = detection["text_only"]
-    blacklist = detection["blacklist"]
-    free: dict[str, dict] = {}
+def is_text_only(model: dict) -> bool:
+    """True when architecture.output_modalities is exactly ["text"]."""
+    architecture = model.get("architecture")
+    outputs = []
+    if isinstance(architecture, dict):
+        outputs = architecture.get("output_modalities") or []
+    return bool(outputs) and all(item == "text" for item in outputs)
+
+
+def _zero_number(value) -> bool:
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, (int, float)):
+        return value == 0
+    if isinstance(value, str):
+        try:
+            return float(value) == 0
+        except ValueError:
+            return False
+    return False
+
+
+def is_zero_cost(entry) -> bool:
+    """True when a models.dev entry reports zero input and output cost."""
+    if not isinstance(entry, dict):
+        return False
+    cost = entry.get("cost")
+    if not isinstance(cost, dict):
+        return False
+    if "input" not in cost or "output" not in cost:
+        return False
+    return _zero_number(cost.get("input")) and _zero_number(cost.get("output"))
+
+
+def is_opencode_free(model_id: str, catalog: dict) -> bool:
+    """OpenCode is free when served and either suffixed `-free` or cost-zero."""
+    if model_id.endswith("-free"):
+        return True
+    return is_zero_cost(catalog.get(model_id))
+
+
+class Detection:
+    """The result of one provider's fetch+detection pass.
+
+    ``free`` maps id -> the snapshot-shaped model dict for that provider.
+    ``reason`` explains, for an id that has left the free set, why.
+    """
+
+    def __init__(self, free: dict, data_len: int, total_count: int, reason):
+        self.free = free
+        self.data_len = data_len
+        self.total_count = total_count
+        self._reason = reason
+
+    def reason(self, model_id: str) -> str:
+        return self._reason(model_id)
+
+
+class Provider:
+    """A code-supported models source, backed by its merged config table."""
+
+    def __init__(self, cfg: dict):
+        self.cfg = cfg
+        self.key = cfg["key"]
+        self.name = cfg["name"]
+
+    @property
+    def url(self) -> str:
+        return self.cfg["url"]
+
+    @property
+    def api_key_env(self) -> str:
+        return self.cfg["api_key_env"]
+
+    @property
+    def model_url(self) -> str:
+        return self.cfg["model_url"]
+
+    @property
+    def sanity_min_fraction(self) -> float:
+        return self.cfg["sanity_min_fraction"]
+
+    def detect(self, checker: "Checker", api_key: str) -> Detection:
+        return _DETECTORS[self.key](checker, self, api_key)
+
+
+def _detect_openrouter(checker: "Checker", provider: Provider, api_key: str) -> Detection:
+    payload, data = checker.fetch_models(provider.url, api_key)
+    total_count = payload.get("total_count")
+    if not isinstance(total_count, int):
+        total_count = len(data)
+
+    mode = provider.cfg["mode"]
+    suffix = provider.cfg["suffix"]
+    text_only = provider.cfg["text_only"]
+    blacklist = provider.cfg["blacklist"]
+
+    all_by_id: dict[str, dict] = {}
     for model in data:
         if not isinstance(model, dict):
             continue
         model_id = model.get("id")
-        if not isinstance(model_id, str) or not model_id:
-            continue
-        if not is_free_model(model, mode):
+        if isinstance(model_id, str) and model_id:
+            all_by_id[model_id] = model
+
+    free: dict[str, dict] = {}
+    for model_id, model in all_by_id.items():
+        if not is_free_model(model, mode, suffix):
             continue
         if any(fnmatch.fnmatch(model_id, pattern) for pattern in blacklist):
             continue
-        if text_only:
-            architecture = model.get("architecture")
-            outputs = []
-            if isinstance(architecture, dict):
-                outputs = architecture.get("output_modalities") or []
-            # Keep only models that output text and nothing else. NOTE: the SPEC
-            # phrased this as "lacks 'text'", but the live catalog gives the
-            # zero-priced Google Lyria pair output_modalities ["text","audio"],
-            # which that literal test would keep. The SPEC's own "Verified API
-            # facts" and the default-configuration contract require the pipeline
-            # to reproduce the 16 :free IDs (Lyria pair excluded), so text_only
-            # means "text-only output".
-            if not outputs or any(item != "text" for item in outputs):
-                continue
+        if text_only and not is_text_only(model):
+            continue
         free[model_id] = model
-    return free
+
+    def reason(model_id: str) -> str:
+        model = all_by_id.get(model_id)
+        if model is None:
+            return "no longer listed"
+        if not is_zero_priced(model.get("pricing")):
+            return "now has pricing"
+        return "no longer free"
+
+    return Detection(free, len(data), total_count, reason)
 
 
-def removal_reason(model_id: str, all_by_id: dict) -> str:
-    """Why an id left the free set; three-valued.
+def _detect_opencode(checker: "Checker", provider: Provider, api_key: str) -> Detection:
+    payload, data = checker.fetch_models(provider.url, api_key)
+    total_count = payload.get("total_count")
+    if not isinstance(total_count, int):
+        total_count = len(data)
 
-    - "no longer listed" - the id is absent from the API response.
-    - "now has pricing"  - the id is still listed but is no longer zero-priced.
-    - "no longer free"   - the id is still zero-priced but filtered out of the
-      free set (blacklist glob or the text_only rule).
-    """
-    model = all_by_id.get(model_id)
-    if model is None:
-        return "no longer listed"
-    if not is_zero_priced(model.get("pricing")):
-        return "now has pricing"
-    return "no longer free"
+    live: set[str] = set()
+    for model in data:
+        if isinstance(model, dict):
+            model_id = model.get("id")
+            if isinstance(model_id, str) and model_id:
+                live.add(model_id)
+
+    catalog = checker.fetch_catalog(provider.cfg["catalog_url"], provider.key)
+
+    free: dict[str, dict] = {}
+    for model_id in live:
+        if is_opencode_free(model_id, catalog):
+            # OpenCode's payload carries no name/description/architecture, so
+            # the snapshot is identifier-only and the display name falls back
+            # to the id.
+            free[model_id] = {"id": model_id}
+
+    def reason(model_id: str) -> str:
+        if model_id not in live:
+            return "no longer listed"
+        entry = catalog.get(model_id)
+        if entry is not None and not is_zero_cost(entry):
+            return "now has pricing"
+        return "no longer free"
+
+    return Detection(free, len(data), total_count, reason)
+
+
+_DETECTORS = {
+    "openrouter": _detect_openrouter,
+    "opencode": _detect_opencode,
+}
 
 
 # --------------------------------------------------------------------------- #
@@ -527,9 +722,8 @@ def removal_reason(model_id: str, all_by_id: dict) -> str:
 # --------------------------------------------------------------------------- #
 
 
-def new_state() -> dict:
+def new_source_state() -> dict:
     return {
-        "schema_version": SCHEMA_VERSION,
         "models": {},
         "last_success": None,
         "failure": {
@@ -538,6 +732,10 @@ def new_state() -> dict:
             "error_notified": False,
         },
     }
+
+
+def new_state() -> dict:
+    return {"schema_version": SCHEMA_VERSION, "sources": {}}
 
 
 def atomic_write_json(path: str, obj) -> None:
@@ -584,9 +782,14 @@ def make_snapshot(model: dict, first_seen: str, notified_at: str | None) -> dict
 # --------------------------------------------------------------------------- #
 
 
-def fetch_models(cfg: dict, api_key: str) -> tuple[dict, list]:
-    url = cfg["api"]["url"]
-    timeout = cfg["api"]["timeout_seconds"]
+def _detail_of(exc: urllib.error.HTTPError) -> str:
+    try:
+        return exc.read().decode("utf-8", "replace")
+    except Exception:  # pragma: no cover - defensive
+        return ""
+
+
+def fetch_models(url: str, timeout: float, api_key: str) -> tuple[dict, list]:
     headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
@@ -596,12 +799,7 @@ def fetch_models(cfg: dict, api_key: str) -> tuple[dict, list]:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             body = response.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as exc:
-        detail = ""
-        try:
-            detail = exc.read().decode("utf-8", "replace")
-        except Exception:  # pragma: no cover - defensive
-            pass
-        raise FetchError("http", str(exc.code), truncate_hard(detail, ERROR_MESSAGE_LIMIT))
+        raise FetchError("http", str(exc.code), truncate_hard(_detail_of(exc), ERROR_MESSAGE_LIMIT))
     except socket.timeout as exc:
         raise FetchError(
             "timeout", "", truncate_hard(str(exc) or "request timed out", ERROR_MESSAGE_LIMIT)
@@ -612,9 +810,7 @@ def fetch_models(cfg: dict, api_key: str) -> tuple[dict, list]:
             raise FetchError(
                 "timeout", "", truncate_hard(str(reason), ERROR_MESSAGE_LIMIT)
             ) from exc
-        raise FetchError(
-            "http", "", truncate_hard(str(reason), ERROR_MESSAGE_LIMIT)
-        ) from exc
+        raise FetchError("http", "", truncate_hard(str(reason), ERROR_MESSAGE_LIMIT)) from exc
     except Exception as exc:  # pragma: no cover - defensive
         raise FetchError(
             "http", "", truncate_hard(f"{type(exc).__name__}: {exc}", ERROR_MESSAGE_LIMIT)
@@ -634,6 +830,48 @@ def fetch_models(cfg: dict, api_key: str) -> tuple[dict, list]:
     return payload, data
 
 
+def fetch_catalog(url: str, timeout: float, etag: str | None) -> tuple[dict | None, str | None]:
+    """Conditional GET of the models.dev catalog.
+
+    Returns ``(payload, new_etag)`` on 200, or ``(None, etag)`` when the server
+    answers 304 Not Modified.
+    """
+    headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
+    if etag:
+        headers["If-None-Match"] = etag
+    request = urllib.request.Request(url, headers=headers, method="GET")
+
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            body = response.read().decode("utf-8", "replace")
+            new_etag = response.headers.get("ETag")
+    except urllib.error.HTTPError as exc:
+        if exc.code == 304:
+            return None, etag
+        raise FetchError("http", str(exc.code), truncate_hard(_detail_of(exc), ERROR_MESSAGE_LIMIT))
+    except socket.timeout as exc:
+        raise FetchError(
+            "timeout", "", truncate_hard(str(exc) or "request timed out", ERROR_MESSAGE_LIMIT)
+        )
+    except urllib.error.URLError as exc:
+        reason = exc.reason
+        if isinstance(reason, (socket.timeout, TimeoutError)):
+            raise FetchError("timeout", "", truncate_hard(str(reason), ERROR_MESSAGE_LIMIT)) from exc
+        raise FetchError("http", "", truncate_hard(str(reason), ERROR_MESSAGE_LIMIT)) from exc
+    except Exception as exc:  # pragma: no cover - defensive
+        raise FetchError(
+            "http", "", truncate_hard(f"{type(exc).__name__}: {exc}", ERROR_MESSAGE_LIMIT)
+        ) from exc
+
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise FetchError("parse", "", truncate_hard(body, ERROR_MESSAGE_LIMIT)) from exc
+    if not isinstance(payload, dict):
+        raise FetchError("parse", "", "catalog response is not a JSON object")
+    return payload, new_etag
+
+
 # --------------------------------------------------------------------------- #
 # Checker
 # --------------------------------------------------------------------------- #
@@ -645,23 +883,33 @@ class Checker:
         cfg: dict,
         base_dir: str,
         webhook_url: str,
-        api_key: str,
         stop_flag: dict,
     ):
         self.cfg = cfg
         self.base_dir = base_dir
         self.webhook_url = webhook_url
-        self.api_key = api_key
         self.stop_flag = stop_flag
         self.state_path = os.path.join(base_dir, "data", "state.json")
         self.history_path = os.path.join(base_dir, "data", "history.jsonl")
         self.templates = load_templates(os.path.join(base_dir, "templates"))
+        self.providers = [
+            Provider(provider)
+            for provider in cfg["providers"]
+            if provider.get("enabled")
+        ]
+        self.api_keys = {
+            provider.key: (os.environ.get(provider.api_key_env) or "").strip()
+            for provider in self.providers
+        }
+        # Process-local models.dev catalog cache, keyed by provider key.
+        self.catalog_cache: dict[str, dict] = {}
+        # Monotonic time of the last webhook send, so [discord].message_gap_seconds
+        # can space out every consecutive send regardless of message type.
+        self._last_send: float | None = None
         self.state: dict = {}
-        self.first_run = False
         self.cycle_ts = utc_now_iso()
 
     # -- setup ------------------------------------------------------------- #
-
 
     def load_state(self) -> dict:
         if not os.path.exists(self.state_path):
@@ -681,17 +929,30 @@ class Checker:
             ) from exc
         if not isinstance(raw, dict):
             raise StateError(f"{self.state_path} is not a JSON object; delete it to re-seed")
-        raw.setdefault("schema_version", SCHEMA_VERSION)
-        if not isinstance(raw.get("models"), dict):
-            raw["models"] = {}
-        raw.setdefault("last_success", None)
-        failure = raw.get("failure")
-        if not isinstance(failure, dict):
-            failure = {}
-        failure.setdefault("consecutive_failures", 0)
-        failure.setdefault("streak_started", None)
-        failure.setdefault("error_notified", False)
-        raw["failure"] = failure
+        sources = raw.get("sources")
+        if raw.get("schema_version") != SCHEMA_VERSION or not isinstance(sources, dict):
+            # No migration: any legacy or unknown shape is ignored and every
+            # enabled provider seeds fresh from its API.
+            logger.warning(
+                "Ignoring %s: not schema v%d; every enabled provider will re-seed",
+                self.state_path,
+                SCHEMA_VERSION,
+            )
+            return new_state()
+        for name, section in list(sources.items()):
+            if not isinstance(section, dict):
+                sources[name] = new_source_state()
+                continue
+            if not isinstance(section.get("models"), dict):
+                section["models"] = {}
+            section.setdefault("last_success", None)
+            failure = section.get("failure")
+            if not isinstance(failure, dict):
+                failure = {}
+            failure.setdefault("consecutive_failures", 0)
+            failure.setdefault("streak_started", None)
+            failure.setdefault("error_notified", False)
+            section["failure"] = failure
         return raw
 
     def save_state(self) -> None:
@@ -703,11 +964,14 @@ class Checker:
     def append_history(
         self,
         event: str,
+        source: str | None = None,
         model_id: str | None = None,
         reason: str | None = None,
         detail: str | None = None,
     ) -> None:
-        record = {"ts": utc_now_iso(), "event": event}
+        record: dict = {"ts": utc_now_iso(), "event": event}
+        if source is not None:
+            record["source"] = source
         if model_id is not None:
             record["id"] = model_id
         if reason is not None:
@@ -721,19 +985,40 @@ class Checker:
         except OSError as exc:
             logger.error("Failed to append history: %s", exc)
 
-    # -- main loop --------------------------------------------------------- #
+    def fetch_models(self, url: str, api_key: str) -> tuple[dict, list]:
+        return fetch_models(url, self.cfg["api"]["timeout_seconds"], api_key)
 
+    def fetch_catalog(self, url: str, provider_key: str) -> dict:
+        cache = self.catalog_cache.setdefault(provider_key, {"etag": None, "models": None})
+        payload, new_etag = fetch_catalog(url, self.cfg["api"]["timeout_seconds"], cache["etag"])
+        if payload is None:
+            # 304 Not Modified: reuse the in-memory catalog.
+            if cache["models"] is None:
+                raise FetchError("parse", "", "catalog answered 304 with no cached copy")
+            logger.info("%s: catalog not modified (304); reusing cache", provider_key)
+            return cache["models"]
+        provider_entry = payload.get(provider_key)
+        if not isinstance(provider_entry, dict):
+            raise FetchError("parse", "", f"catalog has no {provider_key!r} provider")
+        models = provider_entry.get("models")
+        if not isinstance(models, dict):
+            raise FetchError("parse", "", f"catalog {provider_key!r} has no 'models' table")
+        cache["models"] = models
+        cache["etag"] = new_etag
+        return models
+
+    # -- main loop --------------------------------------------------------- #
 
     def run(self) -> None:
         self.state = self.load_state()
-        self.first_run = not self.state.get("models")
         interval = self.cfg["schedule"]["_interval_seconds"]
         delay = 0.0 if self.cfg["schedule"]["run_on_start"] else float(interval)
+        enabled = ", ".join(provider.name for provider in self.providers) or "(none)"
         logger.info(
-            "free-model-checker started (interval=%ss, run_on_start=%s, mode=%s)",
+            "free-model-checker started (interval=%ss, run_on_start=%s, providers=[%s])",
             interval,
             self.cfg["schedule"]["run_on_start"],
-            self.cfg["detection"]["mode"],
+            enabled,
         )
         while not self.stop_flag["flag"]:
             if delay > 0:
@@ -755,67 +1040,91 @@ class Checker:
         return True
 
     def cycle(self) -> int:
-        """Run one cycle; returns the number of seconds to sleep afterwards."""
+        """Run one cycle across all enabled providers.
+
+        Each provider is fetched, guarded and diffed independently; one
+        provider's failure never blocks another's. Model messages from every
+        provider are flushed as a single batch (all new models first, in
+        provider config order then by id, then all removals in the same order).
+        Returns the number of seconds to sleep afterwards.
+        """
         self.cycle_ts = utc_now_iso()
         interval = self.cfg["schedule"]["_interval_seconds"]
+        any_failed = False
+        news: list = []
+        removals: list = []
 
-        try:
-            payload, data = fetch_models(self.cfg, self.api_key)
-        except FetchError as exc:
-            return self._handle_failure(exc)
+        for provider in self.providers:
+            source = self.state["sources"].get(provider.name)
+            if source is None:
+                source = new_source_state()
+                self.state["sources"][provider.name] = source
+            # A provider seeds fresh whenever it has no successful cycle on
+            # record (missing section, or a section created by failures only).
+            fresh = not isinstance(source.get("last_success"), dict)
 
-        total_count = payload.get("total_count")
-        if not isinstance(total_count, int):
-            total_count = len(data)
+            try:
+                detection = provider.detect(self, self.api_keys.get(provider.key, ""))
+            except FetchError as exc:
+                any_failed = True
+                self._handle_failure(provider, source, exc)
+                continue
 
-        if self._sanity_gate(len(data), total_count):
-            return interval
+            if self._sanity_gate(provider, source, detection.data_len, detection.total_count):
+                continue
 
-        failure = self.state["failure"]
-        if failure["consecutive_failures"] > 0:
-            # Only clear the streak once recovery is actually delivered (or was
-            # disabled); a failed recovery POST leaves the streak intact so the
-            # next successful cycle retries it.
-            if self._send_recovery():
-                failure["consecutive_failures"] = 0
-                failure["streak_started"] = None
-                failure["error_notified"] = False
+            failure = source["failure"]
+            if failure["consecutive_failures"] > 0:
+                # Only clear the streak once recovery is actually delivered (or
+                # was disabled); a failed recovery POST leaves the streak intact
+                # so the next successful cycle retries it.
+                if self._send_recovery(provider, source):
+                    failure["consecutive_failures"] = 0
+                    failure["streak_started"] = None
+                    failure["error_notified"] = False
 
-        free = compute_free_set(data, self.cfg)
-        all_by_id = {
-            model["id"]: model
-            for model in data
-            if isinstance(model, dict) and isinstance(model.get("id"), str)
-        }
+            source["last_success"] = {
+                "timestamp": self.cycle_ts,
+                "data_len": detection.data_len,
+                "total_count": detection.total_count,
+            }
 
-        if self.first_run:
-            self._seed(free)
-            self.first_run = False
-        else:
-            self._diff_and_notify(free, all_by_id)
+            if fresh:
+                seeds = self._seed(provider, source, detection.free)
+                news.extend((provider, model_id, model) for model_id, model in seeds)
+            else:
+                provider_news, provider_removals = self._diff(provider, source, detection)
+                news.extend((provider, model_id, model) for model_id, model in provider_news)
+                removals.extend(
+                    (provider, model_id, entry, reason)
+                    for model_id, entry, reason in provider_removals
+                )
 
-        self.state["last_success"] = {
-            "timestamp": self.cycle_ts,
-            "data_len": len(data),
-            "total_count": total_count,
-        }
-        self.save_state()
+            self.save_state()
+            logger.info(
+                "%s: fetched %d models, %d free, %d tracked",
+                provider.name,
+                detection.data_len,
+                len(detection.free),
+                len(source["models"]),
+            )
+
+        self._send_batch(news, removals)
         logger.info(
-            "cycle complete: %d models, %d free, %d in state",
-            len(data),
-            len(free),
-            len(self.state["models"]),
+            "cycle complete: %d provider(s), %d new, %d removed",
+            len(self.providers),
+            len(news),
+            len(removals),
         )
-        return interval
+        return self.cfg["schedule"]["_retry_seconds"] if any_failed else interval
 
     # -- guards ------------------------------------------------------------ #
 
-
-    def _sanity_gate(self, data_len: int, total_count: int) -> bool:
-        fraction = self.cfg["detection"]["sanity_min_fraction"]
+    def _sanity_gate(self, provider: Provider, source: dict, data_len: int, total_count: int) -> bool:
+        fraction = provider.sanity_min_fraction
         if fraction <= 0:
             return False
-        last = self.state.get("last_success")
+        last = source.get("last_success")
         if not isinstance(last, dict):
             return False
         prev_len = last.get("data_len")
@@ -824,8 +1133,9 @@ class Checker:
             return False
         if data_len < fraction * prev_len or total_count < fraction * prev_total:
             logger.warning(
-                "Sanity gate tripped: got %d models (total_count=%d) vs previous "
+                "%s: sanity gate tripped: got %d models (total_count=%d) vs previous "
                 "%d (total_count=%d); skipping cycle, no messages sent",
+                provider.name,
                 data_len,
                 total_count,
                 prev_len,
@@ -833,6 +1143,7 @@ class Checker:
             )
             self.append_history(
                 "cycle_skipped",
+                source=provider.name,
                 detail=f"data_len={data_len} total_count={total_count} "
                 f"previous_data_len={prev_len} previous_total_count={prev_total}",
             )
@@ -840,164 +1151,149 @@ class Checker:
             return True
         return False
 
-    def _handle_failure(self, error: FetchError) -> int:
-        failure = self.state["failure"]
+    def _handle_failure(self, provider: Provider, source: dict, error: FetchError) -> None:
+        failure = source["failure"]
         if failure["consecutive_failures"] == 0:
             failure["streak_started"] = self.cycle_ts
         failure["consecutive_failures"] += 1
         logger.warning(
-            "models API failure #%d (%s %s): %s",
+            "%s: models API failure #%d (%s %s): %s",
+            provider.name,
             failure["consecutive_failures"],
             error.error_type,
             error.error_code,
             error.error_message,
         )
         if self.cfg["discord"]["error_notify"] == "every":
-            self._send_error(error)
+            self._send_error(provider, error)
         elif not failure["error_notified"]:
             # "once": notify on the first delivered warning of the streak. Only
             # mark it sent after a 2xx, so a failed warning is retried next cycle.
-            if self._send_error(error):
+            if self._send_error(provider, error):
                 failure["error_notified"] = True
         self.append_history(
             "error",
+            source=provider.name,
             detail=f"{error.error_type} {error.error_code}".strip(),
         )
         self.save_state()
-        return self.cfg["schedule"]["_retry_seconds"]
 
     # -- first run --------------------------------------------------------- #
 
-
-    def _seed(self, free: dict) -> None:
+    def _seed(self, provider: Provider, source: dict, free: dict) -> list:
+        """Seed a provider's state fresh; returns (id, model) items to announce."""
         now = self.cycle_ts
         notify = self.cfg["discord"]["notify_on_first_run"]
+        seeds = []
         for model_id in sorted(free):
-            self.state["models"][model_id] = make_snapshot(
+            source["models"][model_id] = make_snapshot(
                 free[model_id], now, None if notify else now
             )
-        self.append_history("seed", detail=f"{len(free)} models")
+            if notify:
+                seeds.append((model_id, free[model_id]))
+        self.append_history("seed", source=provider.name, detail=f"{len(free)} models")
         logger.info(
-            "first run: seeded %d free models (notify_on_first_run=%s)",
+            "%s: first run: seeded %d free models (notify_on_first_run=%s)",
+            provider.name,
             len(free),
             notify,
         )
-        if notify:
-            self._send_batch(
-                [("new", model_id, free[model_id]) for model_id in sorted(free)]
-            )
-        else:
+        if not notify:
             self.save_state()
+        return seeds
 
     # -- diff -------------------------------------------------------------- #
 
-
-    def _diff_and_notify(self, free: dict, all_by_id: dict) -> None:
-        free_ids = set(free)
-        new_items = []
+    def _diff(self, provider: Provider, source: dict, detection: Detection) -> tuple[list, list]:
+        free_ids = set(detection.free)
+        news = []
         for model_id in sorted(free_ids):
-            entry = self.state["models"].get(model_id)
+            entry = source["models"].get(model_id)
             if entry is None or entry.get("notified_at") is None:
-                new_items.append((model_id, free[model_id]))
+                news.append((model_id, detection.free[model_id]))
             elif entry.get("pending_removal"):
                 entry["pending_removal"] = None
 
-        removed_items = []
-        for model_id in sorted(self.state["models"]):
+        removals = []
+        for model_id in sorted(source["models"]):
             if model_id in free_ids:
                 continue
-            entry = self.state["models"][model_id]
-            reason = removal_reason(model_id, all_by_id)
+            entry = source["models"][model_id]
+            if entry.get("notified_at") is None:
+                # Never announced (e.g. a first-run send that failed): silently
+                # drop it rather than send a ❌ for a model the operator never saw.
+                source["models"].pop(model_id, None)
+                continue
+            reason = detection.reason(model_id)
             entry["pending_removal"] = reason
-            removed_items.append((model_id, entry, reason))
+            removals.append((model_id, entry, reason))
 
-        if removed_items:
-            self.save_state()
-
-        # One ordered batch: all new models first, then all removals, each group
-        # alphabetical by id. The inter-message gap applies across the group
-        # boundary too, so the whole run is spaced uniformly.
-        batch = [("new", model_id, model) for model_id, model in new_items]
-        batch += [
-            ("removed", model_id, entry, reason)
-            for model_id, entry, reason in removed_items
-        ]
-        self._send_batch(batch)
+        return news, removals
 
     # -- notification batches --------------------------------------------- #
 
+    def _send_batch(self, news: list, removals: list) -> None:
+        """Flush the cycle's model messages as one ordered batch.
 
-    def _send_batch(self, items: list) -> None:
-        """Send an ordered list of messages, spaced, stop-aware.
-
-        Each item is ``("new", model_id, model)`` or
-        ``("removed", model_id, entry, reason)``. The gap is slept between every
-        pair of consecutive messages, including across the new/removed boundary.
-        The gap is ``[discord].message_gap_seconds`` (default 1.0; 0 disables it).
+        All new models go first (provider config order, then id), then all
+        removals (same ordering). Spacing between sends, including error and
+        recovery messages and across the new→removed boundary, is enforced
+        centrally by ``_post`` via ``[discord].message_gap_seconds``.
         """
-        gap = self.cfg["discord"]["message_gap_seconds"]
-        for index, item in enumerate(items):
+        items: list = [("new", *item) for item in news]
+        items += [("removed", *item) for item in removals]
+        for item in items:
             if self.stop_flag["flag"]:
                 return
             if item[0] == "new":
-                self._send_new(item[1], item[2])
+                self._send_new(item[1], item[2], item[3])
             else:
-                self._send_removed(item[1], item[2], item[3])
-            if index < len(items) - 1 and gap > 0:
-                if self._sleep(gap):
-                    return
+                self._send_removed(item[1], item[2], item[3], item[4])
 
-    def _send_new(self, model_id: str, model: dict) -> bool:
+    def _send_new(self, provider: Provider, model_id: str, model: dict) -> bool:
+        source = self.state["sources"][provider.name]
         icon = self.cfg["icons"]["new"]
-        context = self._model_context(model, icon)
+        context = self._model_context(provider, model, icon)
         body = render_template(self.templates["new_model.txt"], context)
         payload = self._build_model_payload(
-            model,
-            icon,
-            context,
-            body,
-            self.cfg["colors"]["new_int"],
+            provider, model, icon, context, body, self.cfg["colors"]["new_int"]
         )
         if not self._post(payload):
             return False
         now = utc_now_iso()
-        entry = self.state["models"].get(model_id)
+        entry = source["models"].get(model_id)
         if entry is None:
-            self.state["models"][model_id] = make_snapshot(model, now, now)
+            source["models"][model_id] = make_snapshot(model, now, now)
         else:
             entry.update(snapshot_fields(model))
             entry["notified_at"] = now
             entry["pending_removal"] = None
             entry.setdefault("first_seen", now)
-        self.append_history("added", model_id=model_id)
+        self.append_history("added", source=provider.name, model_id=model_id)
         self.save_state()
-        logger.info("notified: new free model %s", model_id)
+        logger.info("%s: notified new free model %s", provider.name, model_id)
         return True
 
-    def _send_removed(self, model_id: str, entry: dict, reason: str) -> bool:
+    def _send_removed(self, provider: Provider, model_id: str, entry: dict, reason: str) -> bool:
+        source = self.state["sources"][provider.name]
         icon = self.cfg["icons"]["removed"]
-        context = self._model_context(entry, icon, reason=reason)
+        context = self._model_context(provider, entry, icon, reason=reason)
         body = render_template(self.templates["removed_model.txt"], context)
         payload = self._build_model_payload(
-            entry,
-            icon,
-            context,
-            body,
-            self.cfg["colors"]["removed_int"],
+            provider, entry, icon, context, body, self.cfg["colors"]["removed_int"]
         )
         if not self._post(payload):
             return False
-        self.state["models"].pop(model_id, None)
-        self.append_history("removed", model_id=model_id, reason=reason)
+        source["models"].pop(model_id, None)
+        self.append_history("removed", source=provider.name, model_id=model_id, reason=reason)
         self.save_state()
-        logger.info("notified: %s left the free set (%s)", model_id, reason)
+        logger.info("%s: notified: %s left the free set (%s)", provider.name, model_id, reason)
         return True
 
     # -- payload construction --------------------------------------------- #
 
-
-    def _base_context(self, icon: str) -> dict:
-        """The full 13-key template context, all values empty except ``icon``.
+    def _base_context(self, provider: Provider, icon: str) -> dict:
+        """The full template context, all values empty except icon/source.
 
         Every send helper starts from this so all placeholders are always
         defined (``string.Template`` is rendered without strict mode); each
@@ -1005,6 +1301,7 @@ class Checker:
         """
         return {
             "icon": icon,
+            "source": provider.name,
             "id": "",
             "name": "",
             "context_length": "",
@@ -1019,7 +1316,7 @@ class Checker:
             "failed_cycles": "",
         }
 
-    def _model_context(self, model: dict, icon: str, reason: str = "") -> dict:
+    def _model_context(self, provider: Provider, model: dict, icon: str, reason: str = "") -> dict:
         model_id = model.get("id") or ""
         description = model.get("description")
         if not isinstance(description, str):
@@ -1027,7 +1324,10 @@ class Checker:
         name = model.get("name")
         if not isinstance(name, str):
             name = ""
-        context = self._base_context(icon)
+        url = ""
+        if provider.model_url:
+            url = provider.model_url.replace("{id}", str(model_id))
+        context = self._base_context(provider, icon)
         context.update(
             {
                 "id": str(model_id),
@@ -1037,7 +1337,7 @@ class Checker:
                 "summary": escape_backticks(
                     truncate_words(description, SUMMARY_LIMIT)
                 ),
-                "url": f"{MODEL_URL_PREFIX}{model_id}",
+                "url": url,
                 "reason": reason,
             }
         )
@@ -1063,7 +1363,13 @@ class Checker:
         return fields
 
     def _build_model_payload(
-        self, model: dict, icon: str, context: dict, body: str, color: int
+        self,
+        provider: Provider,
+        model: dict,
+        icon: str,
+        context: dict,
+        body: str,
+        color: int,
     ) -> dict:
         username = self.cfg["discord"]["username"]
         if self.cfg["discord"]["message_format"] == "plain":
@@ -1071,12 +1377,13 @@ class Checker:
             return {"username": username, "content": content}
         display_name = context["name"] or context["id"]
         embed = {
-            "title": truncate_hard(f"{icon} {display_name}", TITLE_LIMIT),
-            "url": context["url"],
+            "title": truncate_hard(f"{icon} [{provider.name}] {display_name}", TITLE_LIMIT),
             "description": truncate_hard(body, EMBED_DESCRIPTION_LIMIT),
             "color": color,
             "timestamp": self.cycle_ts,
         }
+        if context["url"]:
+            embed["url"] = context["url"]
         fields = self._model_fields(model)
         if fields:
             embed["fields"] = fields
@@ -1084,26 +1391,26 @@ class Checker:
 
     # -- error / recovery messages ---------------------------------------- #
 
-
-    def _send_error(self, error: FetchError) -> bool:
+    def _send_error(self, provider: Provider, error: FetchError) -> bool:
         icon = self.cfg["icons"]["error"]
-        context = self._base_context(icon)
+        context = self._base_context(provider, icon)
         context["error_type"] = error.error_type
         context["error_code"] = error.error_code
         context["error_message"] = error.error_message
         body = render_template(self.templates["error.txt"], context)
         payload = self._build_status_payload(
+            provider,
             icon,
-            "OpenRouter models API error",
+            f"{provider.name} models API error",
             body,
             self.cfg["colors"]["error_int"],
             field_value=f"{error.error_type} {error.error_code}".strip(),
         )
         return self._post(payload)
 
-    def _send_recovery(self) -> bool:
+    def _send_recovery(self, provider: Provider, source: dict) -> bool:
         icon = self.cfg["icons"]["recovery"]
-        failure = self.state["failure"]
+        failure = source["failure"]
         failed_cycles = failure.get("consecutive_failures", 0)
         started = parse_iso(failure.get("streak_started")) if failure.get("streak_started") else None
         if started is not None:
@@ -1111,28 +1418,32 @@ class Checker:
             downtime = humanize_duration((now - started).total_seconds())
         else:
             downtime = humanize_duration(0)
-        context = self._base_context(icon)
+        context = self._base_context(provider, icon)
         context["downtime"] = downtime
         context["failed_cycles"] = str(failed_cycles)
         detail = f"downtime={downtime} failed_cycles={failed_cycles}"
         if not self.cfg["discord"]["notify_recovery"]:
             # Nothing to deliver; the streak may be closed.
-            self.append_history("recovery", detail=detail)
+            self.append_history("recovery", source=provider.name, detail=detail)
+            logger.info("%s: models API recovered (%s)", provider.name, detail)
             return True
         body = render_template(self.templates["recovery.txt"], context)
         payload = self._build_status_payload(
+            provider,
             icon,
-            "OpenRouter models API recovered",
+            f"{provider.name} models API recovered",
             body,
             self.cfg["colors"]["new_int"],
         )
         if not self._post(payload):
             return False
-        self.append_history("recovery", detail=detail)
+        self.append_history("recovery", source=provider.name, detail=detail)
+        logger.info("%s: models API recovered (%s)", provider.name, detail)
         return True
 
     def _build_status_payload(
         self,
+        provider: Provider,
         icon: str,
         title_text: str,
         body: str,
@@ -1155,8 +1466,25 @@ class Checker:
 
     # -- webhook delivery -------------------------------------------------- #
 
-
     def _post(self, payload: dict) -> bool:
+        if not self._wait_send_gap():
+            return False
+        try:
+            return self._post_with_retries(payload)
+        finally:
+            self._last_send = time.monotonic()
+
+    def _wait_send_gap(self) -> bool:
+        """Honour [discord].message_gap_seconds before a send. False if stopped."""
+        gap = self.cfg["discord"]["message_gap_seconds"]
+        if gap <= 0 or self._last_send is None:
+            return True
+        wait = gap - (time.monotonic() - self._last_send)
+        if wait > 0 and self._sleep(wait):
+            return False
+        return True
+
+    def _post_with_retries(self, payload: dict) -> bool:
         for _ in range(RETRY_AFTER_ATTEMPTS):
             result = self._post_once(payload)
             if result["ok"]:
@@ -1286,11 +1614,10 @@ def main() -> int:
             env_path,
         )
         return 2
-    api_key = (os.environ.get("OPENROUTER_API_KEY") or "").strip()
 
     install_signal_handlers()
     stop_flag = {"flag": False}
-    checker = Checker(cfg, base_dir, webhook_url, api_key, stop_flag)
+    checker = Checker(cfg, base_dir, webhook_url, stop_flag)
     try:
         checker.run()
     except StateError as exc:

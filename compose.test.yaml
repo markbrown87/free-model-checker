@@ -1,0 +1,43 @@
+# Compose test overlay for free-model-checker.
+#
+# Use together with the base file:
+#   docker compose -f compose.yaml -f compose.test.yaml up -d
+#   docker compose -f compose.yaml -f compose.test.yaml logs -f fake-webhook
+#
+# Adds:
+#   - mock:         static file server serving tools/fixtures on port 8080
+#   - fake-webhook: stdlib fake Discord webhook printing payloads, on port 9090
+# and points the checker at both (test config mount + webhook env).
+#
+# Scenario tips:
+#   - add/remove a model    -> edit tools/fixtures/openrouter/models.json
+#                              (the static server re-reads files each request)
+#   - empty response        -> point the provider url at /openrouter/empty.json
+#   - unreachable host      -> point a provider url at a dead port
+#   - broken webhook        -> override DISCORD_WEBHOOK_URL with a bad URL
+
+services:
+  mock:
+    image: python:3.12-slim
+    command:
+      ["python", "-m", "http.server", "8080", "--bind", "0.0.0.0", "--directory", "/fixtures"]
+    volumes:
+      - ./tools/fixtures:/fixtures:ro
+    restart: unless-stopped
+
+  fake-webhook:
+    image: python:3.12-slim
+    command:
+      ["python", "/app/fake_webhook.py", "--host", "0.0.0.0", "--port", "9090"]
+    volumes:
+      - ./tools/fake_webhook.py:/app/fake_webhook.py:ro
+    restart: unless-stopped
+
+  free-model-checker:
+    depends_on:
+      - mock
+      - fake-webhook
+    environment:
+      - DISCORD_WEBHOOK_URL=http://fake-webhook:9090/hook
+    volumes:
+      - ./tools/test.config.toml:/app/config.toml:ro

@@ -1,0 +1,41 @@
+{
+  "opencode": {
+    "models": {
+      "zephyr-1-free": {
+        "name": "Zephyr 1 Free",
+        "cost": {
+          "input": 0,
+          "output": 0
+        }
+      },
+      "big-pickle": {
+        "name": "Big Pickle",
+        "cost": {
+          "input": 0,
+          "output": 0
+        }
+      },
+      "premium-x": {
+        "name": "Premium X",
+        "cost": {
+          "input": 3,
+          "output": 15
+        }
+      },
+      "test": {
+        "name": "Test",
+        "cost": {
+          "input": 1,
+          "output": 1
+        }
+      },
+      "retired-flash-free": {
+        "name": "Retired Flash Free",
+        "cost": {
+          "input": 0,
+          "output": 0
+        }
+      }
+    }
+  }
+}

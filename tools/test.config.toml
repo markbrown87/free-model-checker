@@ -1,0 +1,57 @@
+# free-model-checker test configuration.
+#
+# Used only by the compose test overlay (compose.test.yaml), mounted read-only
+# over /app/config.toml. Every provider endpoint points at the `mock` static
+# file server so scenarios are reproducible without the real APIs; the webhook
+# is pointed at the `fake-webhook` service via the overlay environment.
+
+[api]
+# Short HTTP timeout so an unreachable mock fails fast during verification.
+timeout_seconds = 10
+
+[schedule]
+# Short interval so editing a fixture file is picked up on the next cycle.
+interval = "30s"
+# Run a cycle immediately at startup.
+run_on_start = true
+# Short retry after a failed cycle so a broken/restored mock is observable.
+retry_delay = "20s"
+
+[providers.openrouter]
+enabled = true
+mode = "zero_price"
+suffix = ":free"
+text_only = true
+blacklist = ["openrouter/*"]
+api_key_env = "OPENROUTER_API_KEY"
+model_url = "https://openrouter.ai/{id}"
+url = "http://mock:8080/openrouter/models.json"
+sanity_min_fraction = 0.5
+
+[providers.opencode]
+enabled = true
+url = "http://mock:8080/opencode/models.json"
+catalog_url = "http://mock:8080/models.dev/api.json"
+api_key_env = "OPENCODE_API_KEY"
+model_url = ""
+sanity_min_fraction = 0.5
+
+[discord]
+message_format = "embed"
+username = "Free Model Checker (test)"
+error_notify = "once"
+notify_recovery = true
+notify_on_first_run = true
+# No spacing between messages so a batch arrives immediately.
+message_gap_seconds = 0
+
+[icons]
+new = "🆕"
+removed = "❌"
+error = "⚠️"
+recovery = "✅"
+
+[colors]
+new = "#2ECC71"
+removed = "#E74C3C"
+error = "#F1C40F"

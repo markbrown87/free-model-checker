@@ -1,0 +1,113 @@
+{
+  "data": [
+    {
+      "id": "acme/alpha:free",
+      "name": "Acme Alpha (free)",
+      "description": "A tiny zero-priced text model used to exercise the OpenRouter free set.",
+      "context_length": 32768,
+      "architecture": {
+        "modality": "text->text",
+        "input_modalities": ["text"],
+        "output_modalities": ["text"]
+      },
+      "pricing": {
+        "prompt": "0",
+        "completion": "0",
+        "request": "0",
+        "image": "0"
+      },
+      "expiration_date": null
+    },
+    {
+      "id": "acme/beta:free",
+      "name": "Acme Beta (free)",
+      "description": "A second zero-priced text model, with a promo expiry, used to exercise the OpenRouter free set.",
+      "context_length": 131072,
+      "architecture": {
+        "modality": "text->text",
+        "input_modalities": ["text"],
+        "output_modalities": ["text"]
+      },
+      "pricing": {
+        "prompt": "0",
+        "completion": "0",
+        "request": "0",
+        "image": "0"
+      },
+      "expiration_date": "2026-12-31T00:00:00Z"
+    },
+    {
+      "id": "google/lyria-002",
+      "name": "Lyria 002",
+      "description": "Mixed-modality zero-priced model; excluded by text_only.",
+      "context_length": 8192,
+      "architecture": {
+        "modality": "text+image->text+audio",
+        "input_modalities": ["text", "image"],
+        "output_modalities": ["text", "audio"]
+      },
+      "pricing": {
+        "prompt": "0",
+        "completion": "0",
+        "request": "0",
+        "image": "0"
+      },
+      "expiration_date": null
+    },
+    {
+      "id": "google/lyria-003",
+      "name": "Lyria 003",
+      "description": "Second mixed-modality zero-priced model; excluded by text_only.",
+      "context_length": 8192,
+      "architecture": {
+        "modality": "text+image->text+audio",
+        "input_modalities": ["text", "image"],
+        "output_modalities": ["text", "audio"]
+      },
+      "pricing": {
+        "prompt": "0",
+        "completion": "0",
+        "request": "0",
+        "image": "0"
+      },
+      "expiration_date": null
+    },
+    {
+      "id": "acme/gamma-pro",
+      "name": "Acme Gamma Pro",
+      "description": "A paid text model; never part of the free set.",
+      "context_length": 200000,
+      "architecture": {
+        "modality": "text->text",
+        "input_modalities": ["text"],
+        "output_modalities": ["text"]
+      },
+      "pricing": {
+        "prompt": "0.0000005",
+        "completion": "0.0000015",
+        "request": "0",
+        "image": "0"
+      },
+      "expiration_date": null
+    },
+    {
+      "id": "openrouter/free",
+      "name": "Auto Router (free)",
+      "description": "Zero-priced text auto-router; excluded by the default blacklist (openrouter/*).",
+      "context_length": 200000,
+      "architecture": {
+        "modality": "text->text",
+        "input_modalities": ["text"],
+        "output_modalities": ["text"]
+      },
+      "pricing": {
+        "prompt": "0",
+        "completion": "0",
+        "request": "0",
+        "image": "0"
+      },
+      "expiration_date": null
+    }
+  ],
+  "total_count": 6
+}

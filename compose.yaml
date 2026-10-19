@@ -1,7 +1,6 @@
 services:
   free-model-checker:
-    build: .
-    image: free-model-checker:latest
+    image: ghcr.io/markbrown87/free-model-checker:latest
     restart: unless-stopped
     env_file: .env
     environment:
@@ -9,3 +8,4 @@ services:
     volumes:
       - ./data:/app/data
       - ./templates:/app/templates:ro
+    # - ./config.toml:/app/config.toml:ro

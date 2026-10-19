@@ -1,0 +1,35 @@
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "zephyr-1-free",
+      "object": "model",
+      "created": 1750000000,
+      "owned_by": "opencode"
+    },
+    {
+      "id": "jev-1.13-free",
+      "object": "model",
+      "created": 1750000001,
+      "owned_by": "opencode"
+    },
+    {
+      "id": "big-pickle",
+      "object": "model",
+      "created": 1750000002,
+      "owned_by": "opencode"
+    },
+    {
+      "id": "premium-x",
+      "object": "model",
+      "created": 1750000003,
+      "owned_by": "opencode"
+    },
+    {
+      "id": "test",
+      "object": "model",
+      "created": 1750000004,
+      "owned_by": "opencode"
+    }
+  ]
+}

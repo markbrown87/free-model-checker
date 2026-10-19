@@ -2,9 +2,7 @@
 # Secrets live in .env — see .env.example.
 
 [api]
-# Models endpoint. Point at a local mock server to test scenarios.
-url = "https://openrouter.ai/api/v1/models"
-# Per-request HTTP timeout in seconds.
+# Per-request HTTP timeout in seconds (governs every provider request).
 timeout_seconds = 30
 
 [schedule]
@@ -14,18 +12,6 @@ interval = "1h"
 run_on_start = true
 # Delay after a failed cycle (fetch/HTTP/parse/empty) before retrying.
 retry_delay = "5m"
-
-[detection]
-# zero_price | suffix | either
-mode = "zero_price"
-# Keep only models whose output modalities are exactly ["text"]; drops
-# mixed-modality models (e.g. the Lyria pair, which output text+audio).
-text_only = true
-# fnmatch globs against the model id; matches are ignored entirely.
-blacklist = ["openrouter/*"]
-# Skip a cycle when the model count drops below this fraction of the last
-# successful cycle. 0 disables the guard.
-sanity_min_fraction = 0.5
 
 [discord]
 # embed | plain
@@ -51,3 +37,44 @@ recovery = "✅"
 new = "#2ECC71"
 removed = "#E74C3C"
 error = "#F1C40F"
+
+# --------------------------------------------------------------------------- #
+# Providers. Each provider is a code-supported integration; you enable it and
+# may override endpoints. An absent table (or enabled = false) disables it.
+# Supported names: openrouter, opencode. An unknown name fails fast.
+# --------------------------------------------------------------------------- #
+
+[providers.openrouter]
+enabled = true
+# zero_price | suffix | either
+mode = "zero_price"
+# Suffix used by the suffix/either modes.
+suffix = ":free"
+# Keep only models whose output modalities are exactly ["text"]; drops
+# mixed-modality models (e.g. the Lyria pair, which output text+audio).
+text_only = true
+# fnmatch globs against the model id; matches are ignored entirely.
+blacklist = ["openrouter/*"]
+# Env var holding the optional API key; no Authorization header when unset.
+api_key_env = "OPENROUTER_API_KEY"
+# Per-model page template; {id} is replaced with the model id.
+model_url = "https://openrouter.ai/{id}"
+# Models endpoint. Point at a mock server to test scenarios.
+url = "https://openrouter.ai/api/v1/models"
+# Skip a cycle when the model count drops below this fraction of the last
+# successful cycle. 0 disables the guard.
+sanity_min_fraction = 0.5
+
+[providers.opencode]
+enabled = true
+# Models endpoint (served models only; publishes no pricing).
+url = "https://opencode.ai/inference/v1/models"
+# models.dev registry used as the pricing source of truth.
+catalog_url = "https://models.dev/api.json"
+# Env var holding the optional API key; no Authorization header when unset.
+api_key_env = "OPENCODE_API_KEY"
+# Empty means no per-model page: messages omit the embed link.
+model_url = ""
+# Skip a cycle when the model count drops below this fraction of the last
+# successful cycle. 0 disables the guard.
+sanity_min_fraction = 0.5
