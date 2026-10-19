@@ -99,8 +99,8 @@ The compose service keeps its local build context **and** references the publish
 Single-arch (build for the current machine, tag, push):
 
 ```sh
-docker build -t ghcr.io/markbrown87/free-model-checker:latest .
-docker push ghcr.io/markbrown87/free-model-checker:latest
+docker build -t ghcr.io/<org-or-self-account>/free-model-checker:latest .
+docker push ghcr.io/<org-or-self-account>/free-model-checker:latest
 ```
 
 Multi-arch (build for `amd64` and `arm64` and push in one step):
@@ -108,7 +108,7 @@ Multi-arch (build for `amd64` and `arm64` and push in one step):
 ```sh
 docker buildx build --platform linux/amd64,linux/arm64 \
   --build-arg GIT_REVISION=$(git rev-parse --short HEAD) \
-  -t ghcr.io/markbrown87/free-model-checker:latest --push .
+  -t ghcr.io/<org-or-self-account>/free-model-checker:latest --push .
 ```
 
 The image has **no build-time `RUN` steps**, so a multi-platform build just copies files into each platform's layer — no QEMU/binfmt emulation is needed on the build host, and the default `docker` builder works. Two notes on the command:
@@ -118,7 +118,7 @@ The image has **no build-time `RUN` steps**, so a multi-platform build just copi
 
 Before pushing you must be authenticated to GHCR (`docker login ghcr.io` with a GitHub personal access token that has `write:packages`).
 
-> **The first push creates a private package.** GHCR packages are private by default, so a target machine cannot pull `ghcr.io/markbrown87/free-model-checker:latest` until you make it public. In GitHub, open your profile (or the repository) → **Packages** → `free-model-checker` → **Package settings** → **Danger Zone** → **Change visibility** → **Public**. (Authenticating the target machine to GHCR is the alternative if you prefer to keep the package private.)
+> **The first push creates a private package.** GHCR packages are private by default, so a target machine cannot pull `ghcr.io/<org-or-self-account>/free-model-checker:latest` until you make it public. In GitHub, open your profile (or the repository) → **Packages** → `free-model-checker` → **Package settings** → **Danger Zone** → **Change visibility** → **Public**. (Authenticating the target machine to GHCR is the alternative if you prefer to keep the package private.)
 
 ### Run the published image without building
 
@@ -233,7 +233,7 @@ Each provider reads the environment variable named by its `api_key_env`; when th
 
 ## Detection semantics
 
-### OpenRouter (unchanged)
+### OpenRouter
 
 Free detection is exactly as before and is fully configurable via `[providers.openrouter]`:
 
@@ -241,7 +241,7 @@ Free detection is exactly as before and is fully configurable via `[providers.op
 - **`text_only`** — keep only outputs that are exactly text.
 - **`blacklist`** — fnmatch globs (default `["openrouter/*"]`) matched against the `id`; matches are ignored entirely, so the `openrouter/free` auto-router never notifies.
 
-### OpenCode (automatic, list-free)
+### OpenCode
 
 OpenCode's models endpoint publishes only `id`/`object`/`created`/`owned_by` — **no pricing, name, description, or architecture** — and there is no per-model detail endpoint. To keep detection fully automatic with no hand-maintained list, the checker combines two sources:
 
